@@ -1,0 +1,34 @@
+module csetjmp extern "C";
+
+struct JmpBufTag @(cname="__jmp_buf_tag", aligned=8) {
+    // TODO: use actual sizes?
+#if SYSTEM_LINUX
+    //long int __jmp_buf[8];       // 64-bit
+    //unsigned long __jmp_buf[6];  // 32-bit
+    char[200] data;
+#endif
+#if SYSTEM_DARWIN
+    // Should be i32[((14 + 8 + 2) * 2)] data;
+    // but size is tested explicitly in
+    // test/globals/static_asserts/static_assert_jmpbuf.c2
+    // and 200 > 192, so this is just suboptimal.
+    //i32[((14 + 8 + 2) * 2)] data;
+    char[200] data;
+#endif
+#if SYSTEM_FREEBSD
+    // long _jb[12];
+    char[200] data;
+#endif
+#if SYSTEM_OPENBSD
+    //typedef long jmp_buf[11];
+    char[200] data;
+#endif
+}
+
+typedef JmpBufTag* JmpBuf @(cname="jmp_buf");
+
+// TODO alias setjmp -> _setjmp
+int setjmp(JmpBuf env);
+int _setjmp(JmpBuf env);
+void longjmp(JmpBuf env, int val) @(noreturn);
+

@@ -1,0 +1,305 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import attr { Attr, AttrKind }
+import attr_table { AttrTable }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+import string_pool { StringPool }
+
+import stdlib { calloc, free }
+
+/*
+    Represents a single file with all its imports, decls, etc
+*/
+public type AST struct @(opaque) {
+    Module* mod;
+    StringPool* auxPool;
+    void* ptr;  // pointer used during analyser/generation (in analysis: Scope*)
+    u32 name;   // into auxPool
+    u32 idx;    // ast idx
+    bool is_interface;
+    bool is_generated;
+
+    ImportDeclList imports;
+    DeclList types;
+    DeclList variables;
+    FunctionDeclList functions;
+    StaticAssertList static_asserts;
+    ArrayValueList array_values;
+
+    attr_table.AttrTable* attrs;
+}
+
+static_assert(144+64, sizeof(AST));
+
+fn AST* AST.create(StringPool* auxPool, u32 name, Module* mod, bool is_interface, bool is_generated) {
+    AST* a = calloc(1, sizeof(AST));
+    a.mod = mod;
+    a.auxPool = auxPool;
+    a.name = name;
+    a.idx = globals.addAST(a);
+    a.is_interface = is_interface;
+    a.is_generated = is_generated;
+    a.imports.init();
+    a.types.init();
+    a.variables.init();
+    a.functions.init();
+    a.static_asserts.init(0);
+    a.array_values.init(0);
+    return a;
+}
+
+fn void AST.free(AST* a) {
+    a.imports.free();
+    a.types.free();
+    a.variables.free();
+    a.functions.free();
+    a.static_asserts.free();
+    a.array_values.free();
+    if (a.attrs) a.attrs.free();
+    free(a);
+}
+
+public fn const char* AST.getFilename(const AST* a) @(unused) {
+    return a.auxPool.idx2str(a.name);
+}
+
+public fn u32 AST.getIdx(const AST* a) { return a.idx; }
+
+public fn u32 AST.getNameIdx(const AST* a) {
+    return a.mod.getNameIdx();
+}
+
+public fn SrcLoc AST.getLoc(const AST* a) {
+    // Note: use the first 'Import' since it is really the module statement
+    Decl* d = (Decl*)a.imports.get(0);
+    return d.getLoc();
+}
+
+public fn void AST.setPtr(AST* a, void* ptr) { a.ptr = ptr; }
+
+public fn void* AST.getPtr(const AST* a) { return a.ptr; }
+
+public fn Module* AST.getMod(const AST* a) @(unused) { return a.mod; }
+
+public fn void AST.addImport(AST* a, ImportDecl* d) {
+    a.imports.add(d);
+}
+
+public fn ImportDecl* AST.findImport(const AST* a, u32 name) {
+    for (u32 i=1; i<a.imports.size(); i++) {
+        ImportDecl* d = a.imports.get(i);
+        if (d.asDecl().getNameIdx() == name) return d;
+    }
+    return nil;
+}
+
+public fn bool AST.isGenerated(const AST* a) @(unused) {
+    return a.is_generated;
+}
+
+public fn bool AST.isInterface(const AST* a) @(unused) {
+    return a.is_interface;
+}
+
+public fn void AST.addFunc(AST* a, FunctionDecl* d) {
+    a.functions.add(d);
+}
+
+public fn void AST.addTypeDecl(AST* a, Decl* d) {
+    a.types.add(d);
+}
+
+public fn void AST.addVarDecl(AST* a, Decl* d) {
+    a.variables.add(d);
+}
+
+public fn void AST.addStaticAssert(AST* a, StaticAssert* s) {
+    a.static_asserts.add(s);
+}
+
+public fn void AST.addArrayValue(AST* a, ArrayValue* v) {
+    a.array_values.add(v);
+}
+
+public type ImportVisitor fn void (void* arg, ImportDecl* d);
+
+public fn void AST.visitImports(const AST* a, ImportVisitor visitor, void* arg) {
+    // Note: skip first 'Import' since it is really the module statement
+    for (u32 i=1; i<a.imports.size(); i++) {
+        visitor(arg, a.imports.get(i));
+    }
+}
+
+public fn const ImportDeclList* AST.getImports(const AST* a) { return &a.imports; }
+
+public type ArrayValueVisitor fn void (void* arg, ArrayValue* avd);
+
+fn void AST.visitArrayValues(AST* a, ArrayValueVisitor visitor, void* arg) {
+    ArrayValue** values = a.array_values.get();
+    for (u32 i=0; i<a.array_values.getCount(); i++) {
+        visitor(arg, values[i]);
+    }
+}
+
+public type FunctionVisitor fn void (void* arg, FunctionDecl* d);
+
+fn void AST.visitTypeFunctions(const AST* a, FunctionVisitor visitor, void* arg) {
+    for (u32 i=0; i<a.functions.size(); i++) {
+        FunctionDecl* d = a.functions.get(i);
+        if (d.hasPrefix()) visitor(arg, d);
+    }
+}
+
+public fn void AST.visitFunctions(const AST* a, FunctionVisitor visitor, void* arg) {
+    for (u32 i=0; i<a.functions.size(); i++) {
+        FunctionDecl* d = a.functions.get(i);
+        visitor(arg, d);
+    }
+}
+
+public type TypeDeclVisitor fn void (void* arg, Decl* d);
+
+public fn void AST.visitTypeDecls(const AST* a, TypeDeclVisitor visitor, void* arg) {
+    for (u32 i=0; i<a.types.size(); i++) {
+        visitor(arg, a.types.get(i));
+    }
+}
+
+public type VarDeclVisitor fn void (void* arg, VarDecl* d);
+
+public fn void AST.visitVarDecls(const AST* a, VarDeclVisitor visitor, void* arg) {
+    for (u32 i=0; i<a.variables.size(); i++) {
+        visitor(arg, (VarDecl*)a.variables.get(i));
+    }
+}
+
+public type StaticAssertVisitor fn void (void* arg, StaticAssert* d);
+
+public fn void AST.visitStaticAsserts(AST* a, StaticAssertVisitor visitor, void* arg) @(unused) {
+    StaticAssert** asserts = a.static_asserts.get();
+    for (u32 i=0; i<a.static_asserts.getCount(); i++) {
+        visitor(arg, asserts[i]);
+    }
+}
+
+public type DeclVisitor fn void (void* arg, Decl* d);
+
+public fn void AST.visitDecls(const AST* a, DeclVisitor visitor, void* arg) {
+    // imports
+    for (u32 i=0; i<a.imports.size(); i++) {
+        visitor(arg, (Decl*)a.imports.get(i));
+    }
+
+    a.visitDeclsWithoutImports(visitor, arg);
+}
+
+fn void AST.visitDeclsWithoutImports(const AST* a, DeclVisitor visitor, void* arg) {
+    // types
+    for (u32 i=0; i<a.types.size(); i++) {
+        visitor(arg, a.types.get(i));
+    }
+
+    // variables
+    for (u32 i=0; i<a.variables.size(); i++) {
+        visitor(arg, a.variables.get(i));
+    }
+
+    // functions
+    for (u32 i=0; i<a.functions.size(); i++) {
+        visitor(arg, (Decl*)a.functions.get(i));
+    }
+}
+
+fn Decl* AST.findType(const AST* a, u32 name_idx) {
+    for (u32 i=0; i<a.types.size(); i++) {
+        Decl* d = a.types.get(i);
+        if (d.getNameIdx() == name_idx) return d;
+    }
+    return nil;
+}
+
+// note: these will be called sequentially for same decl
+public fn void AST.storeAttr(AST* a, Decl* d, const Attr* at)
+{
+    if (!a.attrs) a.attrs = AttrTable.create();
+    a.attrs.add(d, at);
+}
+
+fn const Attr* AST.getAttr(const AST* a, const Decl* d, AttrKind kind)
+{
+    if (a.attrs) return a.attrs.find(d, kind);
+    return nil;
+}
+
+fn void AST.print(const AST* a, StringBuf* out, bool show_funcs) {
+    out.color(col_Normal);
+    out.print("---- AST %s ----\n", a.getFilename());
+
+    for (u32 i=1; i<a.imports.size(); i++) {
+        ImportDecl* d = a.imports.get(i);
+        d.print(out, 0);
+    }
+    if (a.imports.size() > 1) out.newline();
+
+    for (u32 i=0; i<a.types.size(); i++) {
+        Decl* d = a.types.get(i);
+        d.print(out, 0);
+        out.newline();
+    }
+
+    for (u32 i=0; i<a.variables.size(); i++) {
+        Decl* d = a.variables.get(i);
+        d.print(out, 0);
+        out.newline();
+    }
+
+    if (show_funcs) {
+        for (u32 i=0; i<a.functions.size(); i++) {
+            FunctionDecl* d = a.functions.get(i);
+            d.print(out, 0);
+            out.newline();
+        }
+    }
+
+    for (u32 i=0; i<a.static_asserts.getCount(); i++) {
+        a.static_asserts.getAt(i).print(out, 0);
+        out.newline();
+    }
+}
+
+fn void AST.setExported(AST* a) {
+    // types, cannot be really exported, but do mark as such (for used?)
+    for (u32 i=0; i<a.types.size(); i++) {
+        Decl* d = a.types.get(i);
+        d.setExportedIfPublic();
+    }
+
+    // variables
+    for (u32 i=0; i<a.variables.size(); i++) {
+        Decl* d = a.variables.get(i);
+        d.setExportedIfPublic();
+    }
+
+    // functions
+    for (u32 i=0; i<a.functions.size(); i++) {
+        Decl* d = (Decl*)a.functions.get(i);
+        d.setExportedIfPublic();
+    }
+}
+

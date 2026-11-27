@@ -1,0 +1,49 @@
+module sdl_mixer extern "C";
+
+import sdl;
+
+// TODO make nice function names (with Mix_)
+
+// ------ From SDL_audio.h ------
+
+const u32 AUDIO_S16LSB = 0x8010;   // signed 16-bit samples
+// little endian
+const u32 MIX_DEFAULT_FORMAT = AUDIO_S16LSB;
+// TODO big endian
+//const u32 MIX_DEFAULT_FORMAT = AUDIO_S16MSB;
+
+// ------ From SDL_mixer.h ------
+
+const i32 CHANNEL_POST = -2; // MIX_CHANNEL_POST
+
+type Mix_Music struct @(opaque, cname="Mix_Music");
+
+Mix_Music* Mix_LoadMUS(const char* file) @(cname="Mix_LoadMUS");
+
+type Mix_Chunk struct {
+    int allocated;
+    u8* abuf;
+    u32 alen;
+    u8 volume;
+}
+
+// TODO Mix_LoadWAV(file) -> Mix_LoadWAV_RW(SDL_RWFromFile(..)
+Mix_Chunk* Mix_LoadWAV_RW(sdl.RWops* src, int freesrc) @(cname="Mix_LoadWAV_RW");
+sdl.RWops* rwFromFile(const char* file, const char* mode) @(cname="SDL_RWFromFile");
+
+int Mix_OpenAudio(int frequency, u16 format, int channels, int chunksize); //@(cname="Mix_OpenAudio";;
+int Mix_PlayMusic(Mix_Music* music, int loops) @(cname="Mix_PlayMusic");
+int Mix_FadeInMusic(Mix_Music* music, int loops, int ms) @(cname="Mix_FadeInMusic");
+int Mix_PlayChannelTimed(int channel, Mix_Chunk* chunk, int loops, int ticks);
+int Mix_HaltChannel(int channel) @(cname="Mix_HaltChannel");
+int Mix_HaltMusic() @(cname="Mix_HaltMusic");
+int Mix_FadeOutChannel(int which, int ms) @(cname="Mix_FadeOutChannel");
+int Mix_FadeOutMusic(int ms) @(cname="Mix_FadeOutMusic");
+void Mix_FreeChunk(Mix_Chunk* chunk) @(cname="Mix_FreeChunk");
+void Mix_FreeMusic(Mix_Music* music) @(cname="Mix_FreeMusic");
+void Mix_CloseAudio() @(cname="Mix_CloseAudio");
+int Mix_SetPanning(int channel, u8 left, u8 right) @(cname="Mix_SetPanning");
+int Mix_SetDistance(int channel, u8 distance) @(cname="Mix_SetDistance");
+int Mix_SetPosition(int channel, i16 angle, u8 distance) @(cname="Mix_SetPosition");
+
+// TODO many other functions

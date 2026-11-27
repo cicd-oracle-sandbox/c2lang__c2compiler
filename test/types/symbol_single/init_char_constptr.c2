@@ -1,0 +1,18 @@
+// @warnings{no-unused}
+module test;
+
+fn void test1() {
+    const i8 a = 1;
+    i8* b = &a;   // @error{pointer conversion discards const qualifier}
+}
+
+fn void test2() {
+    volatile i8 a = 1;
+    i8* b = &a;   // @error{pointer conversion discards volatile qualifier}
+}
+
+fn void test3() {
+    const volatile i8 a = 1;
+    i8* b = &a;   // @error{pointer conversion discards qualifiers}
+}
+

@@ -1,0 +1,367 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module module_analyser;
+
+import ast { * }
+import ctv_analyser;
+import src_loc { SrcLoc }
+import value_type { Value }
+
+fn void Analyser.analyseFunctionType(Analyser* ma, Decl* d) {
+    FunctionTypeDecl* ftd = (FunctionTypeDecl*)d;
+    FunctionDecl* fd = ftd.getDecl();
+
+    // FunctionTypes (type Foo fn void(Bar b)) only have Partial Dependency on args (dont need definition)
+    ma.analyseFunction(fd, false);
+}
+
+fn void Analyser.analyseAliasType(Analyser* ma, AliasTypeDecl* a) {
+    TypeRef* ref = a.getTypeRef();
+    Decl* d = (Decl*)a;
+    QualType res = ma.analyseTypeRef(ref, true);
+    if (res.isInvalid()) return;
+    QualType qt = d.getType();
+    // Note: type is always AliasType
+    Type* at = qt.getTypeOrNil();
+    QualType canon = res.getCanonicalType();
+    canon.copyQuals(res);
+    at.setCanonicalType(canon);
+}
+
+fn void Analyser.analyseEnumType(Analyser* ma, EnumTypeDecl* d) {
+    u32 num_constants = d.getNumConstants();
+    EnumConstantDecl** constants = d.getConstants();
+    QualType implType = d.getImplType();
+
+    if (num_constants == 0) {
+        ma.error(d.asDecl().getLoc(), "enum without constants");
+        return;
+    }
+
+    bool has_assoc = d.hasAssocValues();
+    bool is_regular = true;
+    Value value = { }
+    Value prev_value;
+    for (u32 i=0; i<num_constants; i++) {
+        EnumConstantDecl* c = constants[i];
+        Decl* ecd = (Decl*)c;
+        ecd.setCheckInProgress();
+
+        c.setIndex(i);
+        // check for duplicate names
+        Decl* cd = (Decl*)c;
+        u32 name_idx = cd.getNameIdx();
+        for (u32 j=0; j<i; j++) {
+            const Decl* other = constants[j].asDecl();
+            if (other.getNameIdx() == name_idx) {
+                ma.error(cd.getLoc(), "duplicate enum constant '%s'", ma.idx2name(name_idx));
+                ma.note(other.getLoc(), "previous definition is here");
+                return;
+            }
+        }
+
+        Expr* initval = c.getInit();
+        if (initval) {
+            // NOTE: associated values are analysed in a separate phase
+            if (!has_assoc) {
+                QualType res = ma.analyseConstExpr(c.getInit2(), true);
+                if (res.isInvalid()) return;
+                initval = c.getInit();  // re-read in case of ImplicitCast has been inserted
+                if (!initval.isCtv()) {
+                    ma.errorRange(initval.getLoc(), initval.getRange(), "initializer is not a compile-time value");
+                    return;
+                }
+                Value ctv = ast.evalExpr(initval);
+                if (ctv.kind == Error) {
+                    ma.errorRange(initval.getLoc(), initval.getRange(), "%s", ctv.error_msg);
+                    return;
+                }
+                if (!ctv_analyser.checkTypeRange(ma.diags, implType, &ctv, 0, initval)) return;
+
+                if (i > 0 && ctv.is_less(&value)) {
+                    value.decr(); // to get the previous value
+                    ma.error(initval.getLoc(), "enum constants need to increase (value %s, previous %s)", ctv.str(), value.str());
+                    return;
+                }
+                value = ctv;
+            }
+        } else {
+            if (!ctv_analyser.checkTypeRange(ma.diags, implType, &value, cd.getLoc(), nil)) return;
+        }
+        if (i == 0) {
+            if (!value.isZero()) is_regular = false;
+        } else {
+            if (!value.isNext(&prev_value)) is_regular = false;
+        }
+        prev_value = value;
+        c.setValue(value);
+        ecd.setChecked();
+        value.incr();
+    }
+    if (is_regular || has_assoc) d.setRegular();
+}
+
+fn QualType Analyser.analyseStructMemberFnTypeRef(Analyser* ma, TypeRef* ref) {
+    const Ref* member = ref.getStructMemberType();
+    // Member.decl is uninitialized!? (member is ok)
+    assert(member.decl);
+    assert(member.decl.isFunction());
+
+    FunctionDecl* fd = (FunctionDecl*)member.decl;
+    ma.analyseFunction(fd, false);
+    if (ma.has_error) return QualType_Invalid;
+    return member.decl.getType();
+}
+
+fn QualType Analyser.analyseUserTypeRef(Analyser* ma, TypeRef* ref, bool full) {
+    assert(ma.mod);
+    const Ref* user = ref.getUser();
+
+    // For template types, decl is already set, no need to check/search
+    if (user.decl) return user.decl.getType();
+
+    const Ref* prefix = ref.getPrefix();
+    Decl* d = nil;
+    if (prefix) {
+        ImportDecl* i = ma.scope.findModule(prefix.name_idx, prefix.loc);
+        if (!i) {
+            ma.has_error = true;
+            return QualType_Invalid;
+        }
+        if (ma.usedPublic) {
+            i.asDecl().setUsedPublic();
+        }
+
+        ref.setPrefix((Decl*)i);
+        Module* mod = i.getDest();
+        d = ma.scope.findSymbolInModule(mod, user.name_idx, user.loc);
+    } else {
+        d = ma.scope.findType(user.name_idx, user.loc, ma.usedPublic);
+    }
+    if (!d) {
+        ma.has_error = true;
+        return QualType_Invalid;
+    }
+
+    if (ma.usedPublic && !d.isPublic()) {
+        if (ma.scope.inFunction()) {
+            ma.error(user.loc, "public inline function using non-public type '%s'", ma.getFullName(d));
+        } else {
+            ma.error(user.loc, "public declaration using non-public type '%s'", ma.getFullName(d));
+        }
+        return QualType_Invalid;
+    }
+
+    ref.setUser(d);
+
+    if (!d.isTypeDecl()) {
+        ma.error(user.loc, "'%s' is not a type", ref.diagName());
+        return QualType_Invalid;
+    }
+
+    full &= !ref.isPointer();
+    DeclCheckState state = d.getCheckState();
+
+    if (full) {
+        if (state == InProgress) {
+            ma.error(user.loc, "circular declaration");
+            return QualType_Invalid;
+        }
+
+        if (state != Checked) ma.analyseGlobalDecl(d);
+    }
+
+    d.setUsed();
+    bool external = (ma.mod != d.getModule());
+    if (external || ma.usedPublic) d.setUsedPublic();
+
+    return d.getType();
+}
+
+fn QualType Analyser.analyseTypeRef(Analyser* ma, TypeRef* ref, bool full) {
+    QualType base;
+    switch (ref.getKind()) {
+    case Builtin:
+        BuiltinKind kind = ref.getBuiltinKind();
+        base = ma.builder.actOnBuiltinType(kind);
+        assert(base.isValid());
+        break;
+    case Void:
+        base = ma.builder.actOnVoidType();
+        assert(base.isValid());
+        break;
+    case User:
+        base = ma.analyseUserTypeRef(ref, full);
+        if (base.isInvalid()) return base;
+        if (!base.hasCanonicalType()) return QualType_Invalid;
+        break;
+    case Function:
+        base = ma.analyseStructMemberFnTypeRef(ref);
+        if (base.isInvalid()) return base;
+        if (!base.hasCanonicalType()) return QualType_Invalid;
+        break;
+    }
+
+    QualType resolved = base;
+    u32 num_ptrs = ref.getNumPointers();
+    resolved.setQuals(ref.getQuals(num_ptrs));
+    for (u32 i = num_ptrs; i-- > 0;) {
+        resolved = ma.builder.actOnPointerType(resolved);
+        resolved.setQuals(ref.getQuals(i));
+    }
+
+    // check opaque struct usage
+    if (ref.isUser() && resolved.isStruct()) {
+        StructType* st = resolved.getStructType();
+        const StructTypeDecl* std = st.getDecl();
+        if (std.isOpaque()) {
+            const Decl* d = (Decl*)std;
+            bool is_external = ma.mod != d.getModule();
+            if (ma.curFunction && ma.curFunction.getInstanceModule() == d.getModule()) {
+                // type is local in instantiation module
+                is_external = false;
+            }
+            if (is_external) {
+                ma.error(ref.getLoc(), "opaque type '%s' used by value", resolved.diagName());
+            } else if (ma.usedPublic) {
+                ma.error(ref.getLoc(), "public declaration using opaque type '%s' by value", resolved.diagName());
+            }
+        }
+    }
+
+    u32 num_arrays = ref.getNumArrays();
+    // Note: iterate in reverse, since outer array comes first
+    for (u32 i=num_arrays; i>0; i--) {
+        Expr** sizeExpr_p = ref.getArray2(i - 1);
+        Expr* sizeExpr = *sizeExpr_p;
+        u32 size = 0;
+        bool is_enum = false;
+        QualType qt = QualType_Invalid;
+        if (sizeExpr) {
+            qt = ma.analyseConstExpr(sizeExpr_p, false);
+            if (qt.isInvalid()) return qt;
+            sizeExpr = *sizeExpr_p;
+            if (sizeExpr.isNValue()) {
+                const EnumType* et = qt.getEnumTypeOrNil();
+                if (!et) {
+                    ma.error(ref.getLoc(), "array size must be an integer or an enum type ('%s')", qt.diagName());
+                    return QualType_Invalid;
+                }
+                const EnumTypeDecl* etd = et.getDecl();
+                is_enum = true;
+                size = etd.getNumConstants();
+                if (!etd.isRegular()) {
+                    ma.error(ref.getLoc(), "%s is not a regular enum", qt.diagName());
+                    return QualType_Invalid;
+                }
+            } else {
+                qt = ma.convertRvalue(sizeExpr_p, qt);
+                if (qt.isInvalid()) return qt;
+
+                sizeExpr = *sizeExpr_p;  // note: ImplicitCast could have been inserted
+
+                // TODO canonical?
+                if (!qt.isInteger()) {
+                    ma.error(ref.getLoc(), "array size has non-integer type '%s'", qt.diagName());
+                    return QualType_Invalid;
+                }
+
+                if (!sizeExpr.isCtv()) {
+                    ma.errorRange(sizeExpr.getLoc(), sizeExpr.getRange(), "array size is not a compile-time value");
+                    return QualType_Invalid;
+                }
+
+                Value value = ast.evalExpr(sizeExpr);
+                if (value.isNegative()) {
+                    ma.errorRange(sizeExpr.getLoc(), sizeExpr.getRange(), "array size has negative value '%s'", value.str());
+                    return QualType_Invalid;
+                }
+                if (!value.checkRange(0, u32.max)) {
+                    ma.errorRange(sizeExpr.getLoc(), sizeExpr.getRange(), "array size '%s' is too large", value.str());
+                    return QualType_Invalid;
+                }
+                size = value.as_u32();
+            }
+            if (size == 0) {
+                ma.errorRange(sizeExpr.getLoc(), sizeExpr.getRange(), "array size may not be zero");
+                return QualType_Invalid;
+            }
+        }
+        if (resolved.isVoid()) {
+            ma.error(ref.getLoc(), "array element has invalid type 'void'");
+            return QualType_Invalid;
+        }
+        resolved = ma.builder.actOnArrayType(resolved, sizeExpr != nil, size, is_enum, qt);
+    }
+    if (ref.isIncrArray()) {
+        resolved = ma.builder.actOnIncrementalArrayType(resolved);
+    }
+
+    if (ref.isUser()) ref.setDest(base.getIndex());
+    return resolved;
+}
+
+fn QualType Analyser.analyseIncrTypeRef(Analyser* ma, TypeRef* ref, u32 size) {
+    // TODO refactor common code with analyseTypeRef
+    QualType base;
+    switch (ref.getKind()) {
+    case Builtin:
+        BuiltinKind kind = ref.getBuiltinKind();
+        base = ma.builder.actOnBuiltinType(kind);
+        assert(base.isValid());
+        break;
+    case User:
+        base = ma.analyseUserTypeRef(ref, true);
+        if (base.isInvalid()) return base;
+        assert(base.hasCanonicalType());
+        break;
+    default:
+        assert(0);
+        break;
+    }
+
+    QualType resolved = base;
+    u32 num_ptrs = ref.getNumPointers();
+    resolved.setQuals(ref.getQuals(num_ptrs));
+    for (u32 i = num_ptrs; i-- > 0;) {
+        resolved = ma.builder.actOnPointerType(resolved);
+        resolved.setQuals(ref.getQuals(i));
+    }
+
+    if (resolved.isVoid()) {
+        ma.error(ref.getLoc(), "array element has invalid type 'void'");
+        return QualType_Invalid;
+    }
+    // always insert a one-dimensional array with size entries
+    resolved = ma.builder.actOnArrayType(resolved, true, size, false, QualType_Invalid);
+
+    if (ref.isUser()) ref.setDest(base.getIndex());
+    return resolved;
+}
+
+fn bool Analyser.checkOpaque(Analyser* ma, const StructTypeDecl* std, SrcLoc loc) {
+    if (std.isOpaque()) {
+        Decl* d = (Decl*)std;
+        Module* other = d.getModule();
+        if (other != ma.mod) {
+            QualType qt = d.getType(); // lazy way to get from decl -> fullname
+            ma.error(loc," cannot dereference opaque struct '%s'", qt.diagNameBare());
+            return false;
+        }
+    }
+    return true;
+}
+

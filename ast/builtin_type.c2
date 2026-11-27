@@ -1,0 +1,137 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import string_buffer { StringBuf }
+
+// Note: dont change positions, since they are used to check interval
+public type BuiltinKind enum u8 (public const char* const name,
+                                 const bool promotable,
+                                 const bool is_signed,
+                                 const bool is_unsigned,
+                                 const bool is_integer,
+                                 const u8 align,
+                                 const u8 width)
+{
+    // Note: align/width is adjusted for 32-bit in globals
+    Bool        : { "bool",  true,  false, false, false, 1,  1 },
+    Char        : { "char",  true,  false, true,  true,  1,  8 },
+    Int8        : { "i8",    true,  true,  false, true,  1,  8 },
+    Int16       : { "i16",   true,  true,  false, true,  2, 16 },
+    Int32       : { "i32",   false, true,  false, true,  4, 32 },
+    Int64       : { "i64",   false, true,  false, true,  8, 64 },
+    UInt8       : { "u8",    true,  false, true,  true,  1,  8 },
+    UInt16      : { "u16",   true,  false, true,  true,  2, 16 },
+    UInt32      : { "u32",   false, false, true,  true,  4, 32 },
+    UInt64      : { "u64",   false, false, true,  true,  8, 64 },
+    Float32     : { "f32",   false, true,  false, false, 4,  0 },
+    Float64     : { "f64",   false, true,  false, false, 8,  0 },
+    ISize       : { "isize", false, true,  false, true,  0,  0 },
+    USize       : { "usize", false, false, true,  true,  0,  0 },
+}
+
+type BuiltinTypeBits struct @(packed) {
+    u32 : NumTypeBits;  // : 16
+    BuiltinKind kind : 4;
+    BuiltinKind base_kind : 4;
+    u32 width : 8;
+}
+static_assert(4, sizeof(BuiltinTypeBits));
+static_assert(sizeof(BuiltinTypeBits), 4);
+
+public type BuiltinType struct @(opaque) {
+    Type base;
+}
+
+fn BuiltinType* BuiltinType.create(Context* c, BuiltinKind kind) {
+    BuiltinKind base_kind = kind;
+    if (kind == ISize) base_kind = (c.getWordSize() == 4) ? Int32 : Int64;
+    if (kind == USize) base_kind = (c.getWordSize() == 4) ? UInt32 : UInt64;
+    BuiltinType* b = c.alloc(sizeof(BuiltinType));
+    b.base.init(Builtin);
+    b.base.builtinTypeBits.kind = kind;
+    b.base.builtinTypeBits.base_kind = base_kind;
+    b.base.builtinTypeBits.width = base_kind.width;
+    b.base.setAlignment(base_kind.align);
+    b.base.setCanonicalType(QualType.create(&b.base));
+#if AstStatistics
+    Stats.addType(Builtin, sizeof(BuiltinType));
+#endif
+    return b;
+}
+
+public fn BuiltinKind BuiltinType.getKind(const BuiltinType* b) {
+    return b.base.builtinTypeBits.kind;
+}
+
+// converts ISize/USize to Int64/UInt64 or Int32/UInt32 depending on arch
+public fn BuiltinKind BuiltinType.getBaseKind(const BuiltinType* b) {
+    return b.base.builtinTypeBits.base_kind;
+}
+
+public fn bool BuiltinType.isInt32(const BuiltinType* b) {
+    return b.getKind() == Int32;
+}
+
+fn bool BuiltinType.isBool(const BuiltinType* b) {
+    return b.getKind() == Bool;
+}
+
+public fn const char* BuiltinType.kind2str(const BuiltinType* b) {
+    return b.getKind().name;
+}
+
+public fn bool BuiltinType.isPromotableIntegerType(const BuiltinType* b) {
+    return b.getKind().promotable;
+}
+
+public fn bool BuiltinType.isInteger(const BuiltinType* b) {
+    return b.getKind().is_integer;
+}
+
+public fn bool BuiltinType.isIntegerOrBool(const BuiltinType* b) {
+    return b.isInteger() || b.getKind() == Bool;
+}
+
+public fn bool BuiltinType.isFloatingPoint(const BuiltinType* b) {
+    return (b.getKind() == Float32 || b.getKind() == Float64);
+}
+
+public fn bool BuiltinType.isSigned(const BuiltinType* b) {
+    return b.getKind().is_signed;
+}
+
+public fn bool BuiltinType.isUnsigned(const BuiltinType* b) {
+    return b.getKind().is_unsigned;
+}
+
+public fn u32 BuiltinType.getAlignment(const BuiltinType* b) {
+    return b.base.typeBits.align;
+}
+
+public fn u32 BuiltinType.getWidth(const BuiltinType* b) {
+    return b.base.builtinTypeBits.width;
+}
+
+fn void BuiltinType.print(const BuiltinType* b, StringBuf* out) {
+    out.add(b.getKind().name);
+}
+
+fn void BuiltinType.fullPrint(const BuiltinType* t, StringBuf* out, u32 indent) {
+    out.indent(indent);
+    out.print("BuiltinType [%p] %s\n", t, t.getKind().name);
+}

@@ -1,0 +1,117 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module init_checker;
+
+import src_loc { SrcLoc }
+
+import stdlib { malloc, free }
+import string { memcpy }
+
+public type InitEntry struct {
+    u32 index;
+    SrcLoc loc;
+}
+
+public type InitChecker struct {
+    InitEntry* entries;
+    u32 count;
+    u32 capacity;
+    u32 max;
+}
+
+// Note: no create/init since zero-initialized
+
+public fn void InitChecker.free(InitChecker* c) {
+    free(c.entries);
+    c.entries = nil;
+    c.count = 0;
+    c.capacity = 0;
+    c.max = 0;
+}
+
+public fn void InitChecker.clear(InitChecker* c) {
+    c.count = 0;
+    c.max = 0;
+}
+
+public fn u32 InitChecker.getCount(const InitChecker* c) {
+    return c.count;
+}
+
+public fn void InitChecker.add(InitChecker* c, u32 index, SrcLoc loc) {
+    if (c.count >= c.capacity) {
+        c.capacity = c.capacity ? c.capacity * 2 : 8;
+        InitEntry* entries = malloc(c.capacity * sizeof(InitEntry));
+        if (c.entries) {
+            memcpy(entries, c.entries, c.count * sizeof(InitEntry));
+            free(c.entries);
+        }
+        c.entries = entries;
+    }
+    InitEntry* entry = &c.entries[c.count];
+    entry.index = index;
+    entry.loc = loc;
+    if (index > c.max) c.max = index;
+    c.count++;
+}
+
+public fn void InitChecker.add2(InitChecker* c, u32 index1, u32 index2, SrcLoc loc) {
+    c.add(index1, loc);
+    if (index1 != index2)
+        c.add(index2, 0);
+}
+
+public fn SrcLoc InitChecker.find(InitChecker* c, u32 index) {
+    if (index > c.max) return 0;
+    for (u32 i = 0; i < c.count; i++) {
+        if (c.entries[i].loc == 0) { // range
+            if (c.entries[i-1].index <= index && c.entries[i].index >= index)
+                return c.entries[i-1].loc;
+        } else {
+            if (c.entries[i].index == index)
+                return c.entries[i].loc;
+        }
+    }
+    return 0;
+}
+
+public fn SrcLoc InitChecker.find2(InitChecker* c, u32 index1, u32 index2, u32* found1p, u32* found2p) {
+    if (index1 > c.max) return 0;
+    for (u32 i = 0; i < c.count; i++) {
+        u32 index = c.entries[i].index;
+        if (c.entries[i].loc == 0) { // range
+            u32 last_index = c.entries[i-1].index;
+            if (last_index <= index2 && index >= index1) {
+                *found1p = index1 >= last_index ? index1 : last_index;
+                *found2p = index2 <= index ? index2 : index;
+                return c.entries[i-1].loc;
+            }
+        } else {
+            if (index >= index1 && index <= index2) {
+                // index inside range
+                *found1p = index;
+                *found2p = index;
+                // compute potential range intersection
+                if (i + 1 < c.count && c.entries[i+1].loc == 0) {
+                    index = c.entries[i+1].index;
+                    *found2p = index2 <= index ? index2 : index;
+                }
+                return c.entries[i].loc;
+            }
+        }
+    }
+    return 0;
+}

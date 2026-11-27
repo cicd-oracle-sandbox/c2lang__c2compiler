@@ -1,0 +1,38 @@
+module lua_lib extern "C";
+
+import lua { State }
+
+int luaopen_base(State *L);
+
+const char[] LUA_COLIBNAME = "coroutine";
+int luaopen_coroutine(State *L);
+
+const char[] LUA_TABLIBNAME = "table";
+int luaopen_table(State *L);
+
+const char[] LUA_IOLIBNAME = "io";
+int luaopen_io(State *L);
+
+const char[] LUA_OSLIBNAME = "os";
+int luaopen_os(State *L);
+
+const char[] LUA_STRINGLIBNAME = "string";
+int luaopen_string(State *L);
+
+const char[] LUA_UTF8LIBNAME = "utf8";
+int luaopen_utf8(State *L);
+
+const char[] LUA_BITLIBNAME = "bit32";
+int luaopen_bit32(State *L);
+
+const char[] LUA_MATHLIBNAME = "math";
+int luaopen_math(State *L);
+
+const char[] LUA_DBLIBNAME = "debug";
+int luaopen_debug(State *L);
+
+const char[] LUA_LOADLIBNAME = "package";
+int luaopen_package(State *L);
+
+// open all previous libraries
+void luaL_openlibs(State *L);

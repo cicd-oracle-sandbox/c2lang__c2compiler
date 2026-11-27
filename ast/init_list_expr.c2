@@ -1,0 +1,145 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+import string { memcpy }
+
+type InitListKind enum u8 {
+    Struct,
+    Array,
+    EnumAssocValues,
+}
+
+type InitListExprBits struct {
+    u32 : NumExprBits;
+    u8 : 0;
+    InitListKind kind : 2;   // InitListKind
+    u32 has_designators : 1;    // ArrayDesignators for array, FieldDesignators for structs
+}
+static_assert(4, sizeof(InitListExprBits));
+
+public type InitListExpr struct @(opaque) {
+    Expr base;
+    SrcLoc endLoc;
+    u32 num_values;
+    Expr*[] values; // tail-allocated
+}
+
+public fn InitListExpr* InitListExpr.create(Context* c, SrcLoc loc, SrcLoc endLoc, Expr** values, u32 num_values) {
+    u32 size = sizeof(InitListExpr) + num_values * sizeof(Expr*);
+    InitListExpr* e = c.alloc(size);
+    e.base.init(InitList, loc, 0, 0, 0, RValue);
+    e.endLoc = endLoc;
+    e.num_values = num_values;
+    if (num_values) {
+        memcpy(e.values, values, num_values * sizeof(Expr*));
+    }
+#if AstStatistics
+    Stats.addExpr(InitList, size);
+#endif
+    return e;
+}
+
+fn Expr* InitListExpr.instantiate(InitListExpr* e, Instantiator* inst) {
+    u32 num_values = e.getNumValues();
+    u32 size = sizeof(InitListExpr) + num_values * sizeof(Expr*);
+    InitListExpr* e2 = inst.c.alloc(size);
+    e2.base = e.base;
+    e2.endLoc = e.endLoc;
+    e2.num_values = num_values;
+    for (u32 i=0; i<num_values; i++) {
+        e2.values[i] = e.values[i].instantiate(inst);
+    }
+#if AstStatistics
+    Stats.addExpr(InitList, size);
+#endif
+    return (Expr*)e2;
+}
+
+fn InitListKind InitListExpr.getKind(const InitListExpr* e) {
+    return e.base.base.initListExprBits.kind;
+}
+
+public fn bool InitListExpr.isArray(const InitListExpr* e) {
+    return e.getKind() == Array;
+}
+
+public fn void InitListExpr.setIsArray(InitListExpr* e) {
+    e.base.base.initListExprBits.kind = Array;
+}
+
+public fn void InitListExpr.setIsEnumAssoc(InitListExpr* e) {
+    e.base.base.initListExprBits.kind = EnumAssocValues;
+}
+
+public fn bool InitListExpr.hasDesignators(const InitListExpr* e) {
+    return e.base.base.initListExprBits.has_designators;
+}
+
+public fn void InitListExpr.setHasDesignators(InitListExpr* e) {
+    e.base.base.initListExprBits.has_designators = 1;
+}
+
+public fn u32 InitListExpr.getNumValues(const InitListExpr* e) {
+    return e.num_values;
+}
+
+public fn Expr** InitListExpr.getValues(InitListExpr* e) {
+    return e.values;
+}
+
+public fn const Expr** InitListExpr.getValues2(const InitListExpr* e) {
+    return (const Expr**)e.values;
+}
+
+public fn SrcLoc InitListExpr.getEndLoc(const InitListExpr* e) {
+    return e.endLoc;
+}
+
+fn void InitListExpr.print(const InitListExpr* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    switch (e.getKind()) {
+    case Struct:
+        out.add(" struct");
+        break;
+    case Array:
+        out.add(" array");
+        break;
+    case EnumAssocValues:
+        out.add(" enum-assoc-values");
+        break;
+    }
+    if (e.hasDesignators()) out.add(" designators");
+    out.newline();
+
+    for (u32 i = 0; i < e.num_values; i++) {
+        e.values[i].print(out, indent + 1);
+    }
+}
+
+fn void InitListExpr.printLiteral(const InitListExpr* e, StringBuf* out) {
+    out.add("{ ");
+    for (u32 i = 0; i < e.num_values; i++) {
+        if (i != 0) out.add(", ");
+        e.values[i].printLiteral(out);
+    }
+    out.add1('}');
+}

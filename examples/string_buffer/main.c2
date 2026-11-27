@@ -1,0 +1,43 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module tester;
+
+import stdio { printf }
+import utils { StringBuffer }   // should be implicit
+
+//type Callback fn void (StringBuffer* buf, const char* text);
+
+public fn i32 main() {
+    StringBuffer* buf = StringBuffer.create(8);
+
+    buf.add("hello ");
+    buf.add("this ");
+    buf.add("is ");
+    buf.add("a ");
+    buf.add("test!");
+    buf.indent(2);
+    buf.add2("xxx", 1);
+    buf.putc('y');
+    buf.printf("%d", 123);
+
+    printf("size = %d\n", buf.size());
+    printf("data = '%s'\n", buf.data());
+
+    buf.clear();
+    buf.destroy();
+    return 0;
+}
+

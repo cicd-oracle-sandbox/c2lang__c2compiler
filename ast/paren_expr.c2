@@ -1,0 +1,69 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+type ParenExprBits struct {
+    u32 : NumExprBits;
+    u32 src_len : 32 - NumExprBits;
+}
+static_assert(4, sizeof(ParenExprBits));
+
+public type ParenExpr struct @(opaque) {
+    Expr base;
+    Expr* inner;
+}
+
+public fn ParenExpr* ParenExpr.create(Context* c, SrcLoc loc, u32 src_len, Expr* inner) {
+    ParenExpr* e = c.alloc(sizeof(ParenExpr));
+    e.base.init(Paren, loc, 0, 0, 0, NValue);
+    e.base.base.parenExprBits.src_len = src_len;
+    e.inner = inner;
+#if AstStatistics
+    Stats.addExpr(Paren, sizeof(ParenExpr));
+#endif
+    return e;
+}
+
+fn Expr* ParenExpr.instantiate(ParenExpr* e, Instantiator* inst) {
+    return (Expr*)ParenExpr.create(inst.c, e.base.base.loc, e.base.base.parenExprBits.src_len, e.inner.instantiate(inst));
+}
+
+public fn Expr* ParenExpr.getInner(const ParenExpr* e) { return e.inner; }
+
+public fn Expr** ParenExpr.getInner2(ParenExpr* e) { return &e.inner; }
+
+fn void ParenExpr.print(const ParenExpr* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.newline();
+
+    e.inner.print(out, indent + 1);
+}
+
+fn SrcLoc ParenExpr.getEndLoc(const ParenExpr* e) {
+    return e.base.base.loc + e.base.base.parenExprBits.src_len;
+}
+
+fn void ParenExpr.printLiteral(const ParenExpr* e, StringBuf* out) {
+    out.lparen();
+    e.inner.printLiteral(out);
+    out.rparen();
+}
+

@@ -1,0 +1,9 @@
+module test;
+
+static i32 a;    // @error{keyword 'static' cannot be used at file scope}
+
+public fn i32 main() {
+    return 0;
+}
+
+

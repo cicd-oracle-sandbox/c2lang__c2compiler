@@ -1,0 +1,4 @@
+upstream: https://github.com/c2lang/c2compiler
+commit: 1be5152164048442c6e6962698a1bac54f3afcaf
+license: Apache-2.0
+Unmodified snapshot except that .github/workflows was emptied.

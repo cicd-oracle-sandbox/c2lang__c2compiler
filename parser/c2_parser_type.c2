@@ -1,0 +1,531 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2_parser;
+
+import ast { * }
+import src_loc { SrcLoc }
+
+import ctype { islower, isupper }
+
+fn void Parser.parseTypeDecl(Parser* p, bool is_public) {
+    p.consumeToken();
+    p.expectIdentifier();
+    u32 type_name = p.tok.name_idx;
+    SrcLoc type_loc = p.tok.loc;
+    const char* name = p.pool.idx2str(type_name);
+    if (!isupper(name[0]) && !p.is_interface) p.error("a type name must start with an upper case character");
+
+    p.consumeToken();
+
+    switch (p.tok.kind) {
+    case KW_fn:
+        p.parseFunctionType(type_name, type_loc, is_public);
+        break;
+    case KW_struct:
+        p.parseStructType(true, type_name, type_loc, is_public);
+        break;
+    case KW_union:
+        p.parseStructType(false, type_name, type_loc, is_public);
+        break;
+    case KW_enum:
+        p.parseEnumType(type_name, type_loc, is_public);
+        break;
+    default:
+        p.parseAliasType(type_name, type_loc, is_public);
+        break;
+    }
+}
+
+fn void Parser.parseFunctionType(Parser* p, u32 name, SrcLoc loc, bool is_public) {
+    p.consumeToken(); // fn
+
+    TypeRefHolder rtype.init();
+    p.parseSingleTypeSpecifier(&rtype);
+
+    VarDeclList params.init();
+
+    bool is_variadic = p.parseFunctionParams(&params, is_public, false);
+    Decl* ftd = p.builder.actOnFunctionTypeDecl(name,
+                                                loc,
+                                                is_public,
+                                                &rtype,
+                                                params.getData(),
+                                                params.size(),
+                                                is_variadic);
+    u32 num_attr = p.parseOptionalAttributes();
+    params.free();
+
+    p.expectAndConsume(Semicolon);
+    p.applyAttributes(ftd, num_attr);
+}
+
+fn void Parser.parseStructType(Parser* p, bool is_struct, u32 name, SrcLoc loc, bool is_public) {
+    p.consumeToken();
+
+    u32 num_attr = p.parseOptionalAttributes();
+
+    DeclList members.init();
+
+    if (p.tok.kind == LBrace) {
+        p.parseStructBlock(&members, is_public);
+    } else if (p.tok.kind == Semicolon) {
+        if (!p.is_interface) p.error("undefined structs are only allowed in interface files");
+        if (!p.builder.hasOpaqueAttr()) p.error("undefined structs must have the opaque attribute");
+        p.consumeToken();
+    } else {
+        p.expectError(LBrace);
+    }
+    StructTypeDecl* d = p.builder.actOnStructType(name,
+                                                  loc,
+                                                  is_public,
+                                                  is_struct,
+                                                  true,
+                                                  members.getData(),
+                                                  members.size());
+    members.free();
+
+    p.applyAttributes((Decl*)d, num_attr);
+}
+
+fn void Parser.checkMemberName(Parser* p) {
+    u32 name = p.tok.name_idx;
+    if (!p.checkName(name, p.is_interface)) {
+        p.error("a struct/union member name must start with a lower case character");
+    }
+    if (p.tok.reserved) {
+        p.diags.error(p.tok.loc, "reserved word '%s' cannot be used as struct/union member name",
+                      p.pool.idx2str(name));
+    }
+}
+
+fn void Parser.parseStructBlock(Parser* p, DeclList* members, bool is_public) {
+    p.expectAndConsume(LBrace);
+
+    while (p.tok.kind != RBrace) {
+        //Syntax:
+        // struct_member ::= type_qualifier type_specifier.
+        // struct_member ::= STRUCT <IDENTIFIER> LBRACE struct_block RBRACE.
+        // struct_member ::= UNION <IDENTIFIER> LBRACE struct_block RBRACE.
+
+        if (p.tok.kind == KW_union || p.tok.kind == KW_struct) {
+            bool is_struct = p.tok.kind == KW_struct;
+            p.consumeToken();
+            // name is optional
+            u32 name = 0;
+            SrcLoc loc = 0;
+            if (p.tok.kind == Identifier) {
+                name = p.tok.name_idx;
+                loc = p.tok.loc;
+
+                p.checkMemberName();
+                p.consumeToken();
+            }
+
+            DeclList sub_members.init();
+
+            p.parseStructBlock(&sub_members, is_public);
+            StructTypeDecl* member = p.builder.actOnStructType(name,
+                                                               loc,
+                                                               is_public,
+                                                               is_struct,
+                                                               false,
+                                                               sub_members.getData(),
+                                                               sub_members.size());
+            sub_members.free();
+            members.add(member.asDecl());
+            continue;
+        }
+
+        Decl* d = nil;
+        if (p.tok.kind == KW_fn) {
+            p.consumeToken(); // fn
+
+            TypeRefHolder rtype.init();
+            p.parseSingleTypeSpecifier(&rtype);
+
+            VarDeclList params.init();
+
+            bool is_variadic = p.parseFunctionParams(&params, is_public, false);
+
+            Decl* fd = p.builder.actOnFunctionType(&rtype,
+                                                   params.getData(),
+                                                   params.size(),
+                                                   is_variadic,
+                                                   StructMember);
+            params.free();
+
+            TypeRefHolder ref.init();
+            ref.setFunction(fd);
+            if (p.tok.kind == LSquare) {
+                p.error("arrays are not allowed for untyped function type members");
+            }
+
+            p.expectIdentifier();
+            u32 name = p.tok.name_idx;
+            SrcLoc loc = p.tok.loc;
+
+            p.checkMemberName();
+            p.consumeToken();
+
+            VarDecl* member = p.builder.actOnStructMember(name, loc, is_public, &ref, nil);
+            d = (Decl*)member;
+            members.add(d);
+            p.applyAttributes(d, p.parseOptionalAttributes());
+
+            goto semi_colon;
+        }
+
+        TypeRefHolder ref.init();
+        p.parseTypeSpecifier(&ref);
+
+        bool multiple_decls = false;
+        for (;;) {
+            u32 name = 0;
+            SrcLoc loc;
+            if (p.tok.kind == Colon) { // anonymous bit-field
+                loc = p.tok.loc;
+            } else {
+                p.expectIdentifier();
+                name = p.tok.name_idx;
+                loc = p.tok.loc;
+
+                p.checkMemberName();
+                p.consumeToken();
+            }
+
+            Expr* bitfield = nil;
+            if (p.tok.kind == Colon) {
+                p.consumeToken();
+                bitfield = p.parseConstExpr();
+            }
+            VarDecl* member = p.builder.actOnStructMember(name, loc, is_public, &ref, bitfield);
+            d = (Decl*)member;
+            members.add(d);
+            SrcLoc attr_loc = 0;
+            if (p.tok.kind == At) {
+                attr_loc = p.tok.loc;
+                p.applyAttributes(d, p.parseOptionalAttributes());
+            }
+            if (attr_loc && (multiple_decls || p.tok.kind == Comma)) {
+                p.error("attributes cannot be to applied to multiple declarations");
+            }
+            if (p.tok.kind != Comma) break;
+            multiple_decls = true;
+            p.consumeToken();
+            if (ref.isPointer() || ref.isArray())
+                p.error("pointer and array members must be defined separately");
+        }
+
+    semi_colon:
+        p.expectAndConsume(Semicolon);
+    }
+
+    p.consumeRBrace();
+}
+
+fn void Parser.parseEnumType(Parser* p, u32 name, SrcLoc loc, bool is_public) {
+    p.consumeToken();
+
+    switch (p.tok.kind) {
+    case KW_char:
+    case KW_f32:
+    case KW_f64:
+        p.error("enum type must be an integer");
+        break;
+    case KW_i8:
+    case KW_i16:
+    case KW_i32:
+    case KW_i64:
+    case KW_isize:
+        break;
+    case KW_reg8:
+    case KW_reg16:
+    case KW_reg32:
+    case KW_reg64:
+        p.error("enum type must be an integer");
+        break;
+    case KW_u8:
+    case KW_u16:
+    case KW_u32:
+    case KW_u64:
+    case KW_usize:
+        break;
+    case KW_void:
+        p.error("enum type must be an integer");
+        break;
+    default:
+        p.error("expected enum type specifier");
+        break;
+    }
+    QualType implType = p.builder.actOnBuiltinType(tokKindToBuiltinKind(p.tok.kind));
+    p.consumeToken();
+
+    bool has_assoc_values = false;
+    // TODO BB FIX memleak on parse error (assoc_values)
+    VarDeclList assoc_values.init();
+    if (p.tok.kind == LParen) {
+        has_assoc_values = true;
+        p.parseEnumAssocAttributes(&assoc_values);
+    }
+
+    u32 num_attr = p.parseOptionalAttributes();
+
+    p.expectAndConsume(LBrace);
+
+    bool is_incr = false;
+
+    DeclList constants.init();
+
+    if (p.tok.kind == Plus) {
+        is_incr = true;
+        p.consumeToken();
+    } else {
+        while (p.tok.kind == Identifier) {
+            u32 const_name = p.tok.name_idx;
+
+            const char* name_str = p.pool.idx2str(const_name);
+            // TODO interface?
+
+            if (islower(name_str[0])) {
+                p.error("an enum constant name must start with an upper case character");
+            }
+            SrcLoc const_loc = p.tok.loc;
+            p.consumeToken();
+
+            Expr* init_expr = nil;
+            if (p.tok.kind == Equal) {
+                if (has_assoc_values) p.error("expected ':' and enum-associated values");
+                p.consumeToken();
+                init_expr = p.parseConstExpr();
+            } else if (p.tok.kind == Colon) {
+                if (!has_assoc_values) p.error("no enum-associated values were defined, so expected none");
+                p.consumeToken();
+                init_expr = p.parseInitList();
+            } else {
+                if (has_assoc_values) {
+                    p.error("missing list of enum-associated values");
+                }
+            }
+
+            EnumConstantDecl* constant = p.builder.actOnEnumConstant(const_name,
+                                                                     const_loc,
+                                                                     is_public,
+                                                                     init_expr);
+            constants.add(constant.asDecl());
+
+            if (p.tok.kind != Comma) break;
+            p.consumeToken();
+        }
+
+        if (constants.size() == 0) {
+            p.error("enum without constants");
+        }
+    }
+
+    p.consumeRBrace();
+
+    EnumTypeDecl* d = p.builder.actOnEnumType(name,
+                                              loc,
+                                              is_public,
+                                              is_incr,
+                                              implType,
+                                              (EnumConstantDecl**)constants.getData(),
+                                              constants.size(),
+                                              assoc_values.getData(),
+                                              (u16)assoc_values.size());
+    assoc_values.free();
+    constants.free();
+
+    p.applyAttributes((Decl*)d, num_attr);
+}
+
+fn void Parser.parseEnumAssocAttributes(Parser* p, VarDeclList* params) {
+    p.expectAndConsume(LParen);
+
+    // TODO error message is obscure: list of associate values cannot be empty
+    if (p.tok.kind == RParen) p.error("expected list of enum-associated value declarations");
+
+    // VarDeclList args
+    while (p.tok.kind != RParen) {
+        VarDecl* decl = p.parseEnumAttribute();
+        decl.setOffset(params.count);  // set argument number
+        params.add(decl);
+
+        if (p.tok.kind != Comma) break;
+        p.consumeToken();
+    }
+
+    p.expectAndConsume(RParen);
+}
+
+fn VarDecl* Parser.parseEnumAttribute(Parser* p) {
+    if (p.tok.kind == KW_static)
+        p.error("keyword '%s' is not allowed here", p.tok.kind.name);
+
+    bool is_public = false;
+    if (p.tok.kind == KW_public) {
+        is_public = true;
+        p.consumeToken();
+    }
+
+    TypeRefHolder ref.init();
+    // Note: dont check arrays in this phase, but in Analyser
+    if (p.tok.kind == KW_fn) {
+        p.consumeToken(); // fn
+
+        TypeRefHolder rtype.init();
+        p.parseSingleTypeSpecifier(&rtype);
+
+        VarDeclList params.init();
+
+        bool is_variadic = p.parseFunctionParams(&params, is_public, false);
+
+        Decl* fd = p.builder.actOnFunctionType(&rtype,
+                                               params.getData(),
+                                               params.size(),
+                                               is_variadic,
+                                               EnumValue);
+        // TODO attributes?
+        //u32 num_attr = p.parseOptionalAttributes();
+        //p.applyAttributes((Decl*)fd, num_attr);
+        params.free();
+
+        ref.setFunction((Decl*)fd);
+
+        if (p.tok.kind == LSquare) {
+            p.error("array types are not allowed here");
+        }
+    } else {
+        p.parseTypeSpecifier(&ref);
+    }
+
+    if (p.tok.kind != Identifier) p.error("expected name");
+
+    SrcLoc loc = p.tok.loc;
+    u32 name = p.tok.name_idx;
+    if (!p.checkName(name, p.is_interface)) {
+        p.error("an enum-associated value name must start with a lower case character");
+    }
+    if (p.tok.reserved) {
+        p.diags.error(loc, "reserved word '%s' cannot be used as enum-associated value name", p.pool.idx2str(name));
+    }
+    p.consumeToken();
+
+    Expr* initValue = nil;
+    SrcLoc assignLoc = 0;
+
+    if (p.tok.kind == Equal) {
+        // TBD allowed?
+        bool accept_default = true;  // TODO BB
+        if (!accept_default) p.error("default enum-associated values are not allowed in type definitions");
+        assignLoc = p.tok.loc;
+        p.consumeToken();
+        initValue = p.parseInitExpr();
+    }
+
+    VarDecl* param = p.builder.actOnEnumValue(name, loc, is_public, &ref, assignLoc, initValue);
+
+    u32 num_attr = p.parseOptionalAttributes();
+    p.applyAttributes((Decl*)param, num_attr);
+
+    return param;
+}
+
+fn void Parser.parseAliasType(Parser* p, u32 name, SrcLoc loc, bool is_public) {
+    TypeRefHolder ref.init();
+    p.parseTypeSpecifier(&ref);
+
+    Decl* d = p.builder.actOnAliasType(name, loc, is_public, &ref);
+    u32 num_attr = p.parseOptionalAttributes();
+    p.expectAndConsume(Semicolon);
+    p.applyAttributes(d, num_attr);
+}
+
+fn void Parser.parseCEnum(Parser* p, bool is_public) {
+    p.consumeToken();
+    p.expectIdentifier();
+    u32 type_name = p.tok.name_idx;
+    SrcLoc type_loc = p.tok.loc;
+    const char* name = p.pool.idx2str(type_name);
+    if (!isupper(name[0]) && !p.is_interface) p.error("a type name must start with an upper case character");
+
+    p.consumeToken();
+    if (p.tok.kind != Colon) p.error("a C enum must specify an implementation type with ':'");
+    p.parseEnumType(type_name, type_loc, is_public);
+}
+
+fn void Parser.parseCStruct(Parser* p, bool is_struct, bool is_public) {
+    p.consumeToken();
+    p.expectIdentifier();
+    u32 type_name = p.tok.name_idx;
+    SrcLoc type_loc = p.tok.loc;
+    const char* name = p.pool.idx2str(type_name);
+    if (!isupper(name[0]) && !p.is_interface) p.error("a type name must start with an upper case character");
+    p.parseStructType(is_struct, type_name, type_loc, is_public);
+}
+
+fn void Parser.parseTypedef(Parser* p, bool is_public) {
+    p.consumeToken();  // typedef
+    // TODO: reject struct, union, enum
+    TypeRefHolder ref.init();
+    p.parseTypeSpecifier(&ref);
+
+    u32 type_name = 0;
+    SrcLoc loc = 0;
+    Decl* d = nil;
+
+    if (p.tok.kind == LParen
+    &&  p.peekToken(1) == Star
+    &&  p.peekToken(2) == Identifier
+    &&  p.peekToken(3) == RParen
+    &&  p.peekToken(4) == LParen) {
+        // function pointer
+        p.consumeToken();   // '('
+        p.consumeToken();   // '*'
+        type_name = p.tok.name_idx;
+        loc = p.tok.loc;
+        p.consumeToken();   // name
+        p.consumeToken();   // ')'
+    } else {
+        p.expectIdentifier();
+        type_name = p.tok.name_idx;
+        loc = p.tok.loc;
+        p.consumeToken();
+    }
+    if (p.tok.kind == LParen) {
+        VarDeclList params.init();
+        bool is_variadic = p.parseFunctionParams(&params, is_public, false);
+        d = p.builder.actOnFunctionTypeDecl(type_name, loc, is_public, &ref,
+                                            params.getData(), params.size(), is_variadic);
+        params.free();
+    } else {
+        if (p.tok.kind == LSquare) {
+            u32 num_arrays = ref.getNumArrays();
+            p.parseOptionalArray(&ref);
+            ref.rotateArrays(num_arrays);
+        }
+        const char* name = p.pool.idx2str(type_name);
+        if (!isupper(name[0]) && !p.is_interface) p.diags.error(loc, "a type name must start with an upper case character");
+        if (p.tok.reserved) {
+            p.diags.error(loc, "reserved word '%s' cannot be used as local variable name",
+                          p.pool.idx2str(type_name));
+        }
+        d = p.builder.actOnAliasType(type_name, loc, is_public, &ref);
+    }
+    u32 num_attr = p.parseOptionalAttributes();
+    p.expectAndConsume(Semicolon);
+    p.applyAttributes(d, num_attr);
+}

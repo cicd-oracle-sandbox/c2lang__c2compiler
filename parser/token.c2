@@ -1,0 +1,217 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module token;
+
+import number_radix { Radix }
+import src_loc { SrcLoc }
+
+import string { memset }
+
+public type Kind enum u8 (public const char* const name) {
+    None                 : { "none" },
+    Identifier           : { "identifier" },  // abc
+    IntegerLiteral       : { "integer" },     // 123
+    FloatLiteral         : { "float" },       // 3.1415
+    CharLiteral          : { "character"},    // 'c'
+    StringLiteral        : { "string"},       // "abc"
+    LParen               : { "(" },
+    RParen               : { ")" },
+    LSquare              : { "[" },
+    RSquare              : { "]" },
+    LBrace               : { "{" },
+    RBrace               : { "}" },
+    Exclaim              : { "!" },
+    ExclaimEqual         : { "!=" },
+    Star                 : { "*" },
+    StarEqual            : { "*=" },
+    Amp                  : { "&" },
+    AmpAmp               : { "&&" },
+    AmpEqual             : { "&=" },
+    Pipe                 : { "|" },
+    PipePipe             : { "||" },
+    PipeEqual            : { "|=" },
+    Equal                : { "=" },
+    EqualEqual           : { "==" },
+    Semicolon            : { ";" },
+    Colon                : { ":" },
+    At                   : { "@" },
+    Caret                : { "^" },
+    CaretEqual           : { "^=" },
+    Question             : { "?" },
+    Dot                  : { "." },
+    Ellipsis             : { "..." },
+    Comma                : { "," },
+    Plus                 : { "+" },
+    PlusPlus             : { "++" },
+    PlusEqual            : { "+=" },
+    Minus                : { "-" },
+    MinusMinus           : { "--" },
+    MinusEqual           : { "-=" },
+    Tilde                : { "~" },
+    Slash                : { "/" },
+    SlashEqual           : { "/=" },
+    Percent              : { "%" },
+    PercentEqual         : { "%=" },
+    Less                 : { "<" },
+    LessLess             : { "<<" },
+    LessEqual            : { "<=" },
+    LessLessEqual        : { "<<=" },
+    Greater              : { ">" },
+    GreaterGreater       : { ">>" },
+    GreaterEqual         : { ">=" },
+    GreaterGreaterEqual  : { ">>=" },
+    // builtin-types
+    KW_bool              : { "bool" }, // keep as first BuiltinType  since we check range
+    KW_char              : { "char" },
+    KW_i8                : { "i8" },
+    KW_i16               : { "i16" },
+    KW_i32               : { "i32" },
+    KW_i64               : { "i64" },
+    KW_u8                : { "u8" },
+    KW_u16               : { "u16" },
+    KW_u32               : { "u32" },
+    KW_u64               : { "u64" },
+    KW_reg8              : { "reg8" },
+    KW_reg16             : { "reg16" },
+    KW_reg32             : { "reg32" },
+    KW_reg64             : { "reg64" },
+    KW_isize             : { "isize" },
+    KW_usize             : { "usize" },
+    KW_f32               : { "f32" },
+    KW_f64               : { "f64" },
+    KW_void              : { "void" },
+    // keep as last BuiltinType since we check range
+    // C type
+    KW_int               : { "int" },
+    KW_ssize_t           : { "ssize_t" },
+    KW_size_t            : { "size_t" },
+    KW_float             : { "float" },
+    KW_double            : { "double" },
+    KW_short             : { "short" },
+    KW_long              : { "long" },
+    KW_signed            : { "signed" },
+    KW_unsigned          : { "unsigned" },
+    // C keyword
+    KW_typedef           : { "typedef" },
+    // other keywords
+    KW_as                : { "as" },
+    KW_asm               : { "asm" },
+    KW_assert            : { "assert" },
+    KW_break             : { "break" },
+    KW_case              : { "case" },
+    KW_const             : { "const" },
+    KW_continue          : { "continue" },
+    KW_default           : { "default" },
+    KW_countof           : { "countof" },
+    KW_else              : { "else" },
+    KW_enum              : { "enum" },
+    KW_extern            : { "extern" },
+    KW_fallthrough       : { "fallthrough" },
+    KW_false             : { "false" },
+    KW_fn                : { "fn" },
+    KW_for               : { "for" },
+    KW_goto              : { "goto" },
+    KW_if                : { "if" },
+    KW_import            : { "import" },
+    KW_module            : { "module" },
+    KW_nil               : { "nil" },
+    KW_offsetof          : { "offsetof" },
+    KW_public            : { "public" },
+    KW_return            : { "return" },
+    KW_sizeof            : { "sizeof" },
+    KW_static            : { "static" },
+    KW_static_assert     : { "static_assert" },
+    KW_struct            : { "struct" },
+    KW_switch            : { "switch" },
+    KW_template          : { "template" },
+    KW_tlocal            : { "tlocal" },
+    KW_to_container      : { "to_container" },
+    KW_true              : { "true" },
+    KW_type              : { "type" },
+    KW_union             : { "union" },
+    KW_va_arg            : { "va_arg" },
+    KW_volatile          : { "volatile" },
+    KW_while             : { "while" },
+    // only in raw mode
+    Feat_if              : { "#if" },
+    Feat_ifdef           : { "#ifdef" },
+    Feat_ifndef          : { "#ifndef" },
+    Feat_elif            : { "#elif" },
+    Feat_else            : { "#else" },
+    Feat_endif           : { "#endif" },
+    Feat_error           : { "#error" },
+    Feat_warning         : { "#warning" },
+    Invalid              : { "invalid" },
+    LineComment          : { "l-comment" },
+    BlockComment         : { "b-comment" },
+    // Special Token
+    Eof                  : { "eof" },
+    Error                : { "error" },
+}
+
+
+public fn bool Kind.isKeyword(Kind kind) {
+    return kind >= KW_bool && kind <= KW_while;
+}
+
+public fn bool Kind.isQualifier(Kind kind) {
+    return kind == KW_const || kind == KW_volatile;
+}
+
+public fn bool Kind.isBuiltinType(Kind kind) {
+    return kind >= KW_bool && kind < KW_void;
+}
+
+public fn bool Kind.isTypeKeyword(Kind kind) {
+    return kind >= KW_bool && kind <= KW_unsigned;
+}
+
+public fn bool Kind.isCType(Kind kind) {
+    return kind >= KW_int && kind <= KW_unsigned;
+}
+
+public type Token struct {
+    SrcLoc loc;
+    u16 len : 16;
+    Kind kind : 8;
+    bool done : 1;
+    // TODO: fix QualType.getBitFieldWidth() to return actual number of bits instead of implementation type
+    Radix radix : 2;   // for IntegerLiteral (2,8,10,16), FloatLiteral(10,16) and CharLiteral (8,16)
+    u8 raw : 1;     // for StringLiteral
+    bool reserved : 1;
+    bool suffix_F : 1;
+    union {
+        const char* error_msg;  // ERROR
+        struct {           // StringLiteral, LineComment, BlockComment
+            u32 text_idx;  // pool index of encoded string or comment
+            u32 text_len;  // length of converted string (without null terminator)
+        }
+        u32 name_idx;      // Identifier and all keywords
+        u64 int_value;     // IntegerLiteral
+        f64 float_value;   // FloatLiteral
+        u8 char_value;     // CharLiteral
+        char[8] invalid;   // Invalid
+    }
+}
+static_assert(16, sizeof(Token));
+
+public fn void Token.init(Token* tok) {
+    memset(tok, 0, sizeof(Token));
+}
+
+public fn Radix Token.getRadix(const Token* tok) {
+    return tok.radix;
+}

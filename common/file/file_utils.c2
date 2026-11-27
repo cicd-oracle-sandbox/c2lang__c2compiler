@@ -1,0 +1,236 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module file_utils;
+
+import c_errno { errno, ENAMETOOLONG, EEXIST, EINVAL }
+import stdio { vsnprintf }
+import string { memcpy, pstrcpy, strerror, strlen }
+import sys_stat { Stat, stat, S_IFMT, S_IFREG, S_IFDIR, mkdir }
+import unistd { getcwd }
+
+public const u32 Max_path = 512;
+
+public fn const char* get_basename(const char* s) {
+    const char* base = s;
+    while (*s) {
+        if (*s++ == '/') base = s;
+    }
+    return base;
+}
+
+public fn const char* get_extension(const char* s) {
+    const char* ext = nil;
+    for (; *s; s++) {
+        if (*s == '/') ext = nil;
+        if (*s == '.') ext = s;
+    }
+    return ext ? ext : s;
+}
+
+// Copy a directory name with truncation and append a / if not empty
+fn usize copy_dirname(char* buf, usize size, const char* dir) {
+    usize pos = pstrcpy(buf, size, dir);
+    if (pos && pos < size && dir[pos - 1] != '/') {
+        if (pos + 1 < size) {
+            buf[pos] = '/';
+            buf[pos + 1] = '\0';
+        }
+        pos += 1;
+    }
+    return pos;
+}
+
+// construct a path in a buffer from a pathname, a filename and an extension
+// if the path fits in the destination array, a pointer to it is returned.
+// otherwise the path is truncated, errno is set to ENAMETOOLONG and nil is returned
+// both the filename and the extension can be nil or omitted
+public fn const char* make_path(char* buf, usize size, const char* path, const char* filename = nil, const char* ext = nil) {
+    usize pos = 0;
+    if (filename) {
+        if (*filename != '/') pos = copy_dirname(buf, size, path);
+        pos += pstrcpy(buf + pos, size - pos, filename);
+        if (ext) pos += pstrcpy(buf + pos, size - pos, ext);
+    } else {
+        pos = pstrcpy(buf, size, path);
+    }
+    if (pos < size) return buf;
+    errno = ENAMETOOLONG;
+    return nil;
+}
+
+// construct a path in a buffer from a directory name, a subdirectory name and a filename
+// if the path fits in the destination array, a pointer to it is returned.
+// otherwise the path is truncated, errno is set to ENAMETOOLONG and nil is returned
+fn const char* make_path3(char* buf, usize size, const char* dir, const char* subdir, const char* filename) {
+    usize pos = 0;
+    if (*filename != '/') {
+        if (*subdir != '/') pos = copy_dirname(buf, size, dir);
+        pos += copy_dirname(buf + pos, size - pos, subdir);
+    }
+    pos += pstrcpy(buf + pos, size - pos, filename);
+    if (pos < size) return buf;
+    errno = ENAMETOOLONG;
+    return nil;
+}
+
+// returns 0 on success, errno on failure
+// create a directory path, OK if exists already
+public fn i32 create_path(const char* path) {
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!*path) return 0;
+    if (is_dir(path)) return 0;
+    char[Max_path] tmp;
+    u32 len = 0;
+    tmp[len++] = *path++;
+    while (len < countof(tmp)) {
+        char c = *path++;
+        // ignore duplicate and trailing slashes
+        if (c == '/' && (tmp[len - 1] == '/' || *path == '\0')) continue;
+        // create subdirectory chain if needed
+        if (c == '/' || c == '\0') {
+            tmp[len] = '\0';
+            if (mkdir(tmp, 0777) && errno != EEXIST)
+                return errno;
+            if (c == '\0')
+                return 0;
+        }
+        tmp[len++] = c;
+    }
+    return errno = ENAMETOOLONG;
+}
+
+public fn bool path_exists(const char* path) {
+    Stat statbuf;
+    return !stat(path, &statbuf);
+}
+
+public fn bool is_file(const char* filename) @(unused) {
+    Stat statbuf;
+    return !stat(filename, &statbuf) && (statbuf.st_mode & S_IFMT) == S_IFREG;
+}
+
+public fn bool is_dir(const char* dirname) @(unused) {
+    Stat statbuf;
+    return !stat(dirname, &statbuf) && (statbuf.st_mode & S_IFMT) == S_IFDIR;
+}
+
+public type Pathname struct @(unused) {
+    char[Max_path] path;
+    i32 error;
+}
+
+public fn bool Pathname.init(Pathname* file, const char* dir, const char* filename = nil, const char* ext = nil) {
+    file.error = 0;
+    if (!make_path(file.path, countof(file.path), dir, filename, ext)) {
+        file.error = ENAMETOOLONG;
+        return false;
+    }
+    return true;
+}
+
+public fn bool Pathname.initf(Pathname* file, const char* format @(printf_format), ...) @(unused) {
+    va_list args;
+    va_start(args, format);
+    i32 len = vsnprintf(file.path, countof(file.path), format, args);
+    va_end(args);
+    if (len < 0) {
+        file.error = errno;
+        return false;
+    }
+    if ((u32)len >= countof(file.path)) {
+        file.error = ENAMETOOLONG;
+        return false;
+    }
+    file.error = 0;
+    return true;
+}
+
+public fn bool Pathname.init_subdir(Pathname* file, const char* dir, const char* subdir, const char* filename) @(unused) {
+    if (!make_path3(file.path, countof(file.path), dir, subdir, filename)) {
+        file.error = errno;
+        return false;
+    }
+    file.error = 0;
+    return true;
+}
+
+public fn bool Pathname.init_cwd(Pathname* file) @(unused) {
+    if (!getcwd(file.path, countof(file.path))) {
+        file.error = errno;
+        *file.path = '\0';
+        return false;
+    }
+    file.error = 0;
+    return true;
+}
+
+public fn bool Pathname.init_len(Pathname* file, const char* s, u32 len) @(unused) {
+    if (len < countof(file.path)) {
+        memcpy(file.path, s, len);
+        file.path[len] = '\0';
+        file.error = 0;
+        return true;
+    }
+    memcpy(file.path, s, countof(file.path) - 1);
+    file.path[countof(file.path) - 1] = '\0';
+    file.error = ENAMETOOLONG;
+    return false;
+}
+
+public fn bool Pathname.append_name(Pathname* file, const char* name) @(unused) {
+    usize pos = strlen(file.path);
+    if (pos && file.path[pos - 1] != '/') {
+        if (pos < countof(file.path) - 1) file.path[pos] = '/';
+        pos++;
+    }
+    pos = pstrcpy(file.path + pos, countof(file.path) - pos, name);
+    if (pos < countof(file.path)) return true;
+    file.error = ENAMETOOLONG;
+    return false;
+}
+
+public fn void Pathname.deinit(Pathname* file) @(unused) {}
+
+public fn const char* Pathname.get_extension(const Pathname* file) @(unused) {
+    return get_extension(file.path);
+}
+
+public fn const char* Pathname.get_basename(const Pathname* file) @(unused) {
+    return get_basename(file.path);
+}
+
+public fn bool Pathname.exists(const Pathname* file) @(unused) {
+    return path_exists(file.path);
+}
+
+public fn bool Pathname.is_file(const Pathname* file) @(unused) {
+    return is_file(file.path);
+}
+
+public fn bool Pathname.is_dir(const Pathname* file) @(unused) {
+    return is_dir(file.path);
+}
+
+public fn bool Pathname.create_path(const Pathname* file) @(unused) {
+    return create_path(file.path);
+}
+
+public fn const char* Pathname.getError(const Pathname* file) @(unused) {
+    return strerror(file.error);
+}

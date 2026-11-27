@@ -1,0 +1,108 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type ImplicitCastKind enum u8 (const char* const name) {
+    ArrayToPointerDecay : { "ArrayToPointerDecay" },
+    LValueToRValue      : { "LValueToRValue" },
+    PointerToBoolean    : { "PointerToBoolean" },
+    PointerToInteger    : { "PointerToInteger" },
+    IntegralCast        : { "IntegralCast" },
+    BitCast             : { "BitCast" },    // pointer conversion (char* -> i32*, or void* -> FunctionPtr)
+}
+
+type ImplicitCastBits struct @(packed) {
+    u32 : NumExprBits;
+    u8 : 0;
+    ImplicitCastKind kind : 3;
+    u32 : 13;
+}
+static_assert(4, sizeof(ImplicitCastBits));
+
+public type ImplicitCastExpr struct @(opaque) {
+    Expr base;
+    Expr* inner;
+}
+
+public fn ImplicitCastExpr* ImplicitCastExpr.create(Context* c, SrcLoc loc, ImplicitCastKind kind, Expr* inner) {
+    ImplicitCastExpr* e = c.alloc(sizeof(ImplicitCastExpr));
+    e.base.init(ImplicitCast, loc, 0, 0, inner.hasEffect(), RValue);
+    e.base.base.implicitCastBits.kind = kind;
+    e.inner = inner;
+    e.base.copyConstantFlags(inner);
+    switch (kind) {
+    case ArrayToPointerDecay:
+        e.base.copyValType(inner);
+        e.base.base.exprBits.is_ctv = false;
+        break;
+    case LValueToRValue:
+        e.base.base.exprBits.is_ctc = false;
+        break;
+    case PointerToBoolean:
+        e.base.copyValType(inner);
+        break;
+    case PointerToInteger:
+        e.base.copyValType(inner);
+        break;
+    case IntegralCast:
+        e.base.copyValType(inner);
+        break;
+    case BitCast:
+        e.base.base.exprBits.is_ctc = false;
+        break;
+    }
+#if AstStatistics
+    Stats.addExpr(ImplicitCast, sizeof(ImplicitCastExpr));
+#endif
+    return e;
+}
+
+public fn ImplicitCastKind ImplicitCastExpr.getKind(const ImplicitCastExpr* e) {
+    return e.base.base.implicitCastBits.kind;
+}
+
+public fn bool ImplicitCastExpr.isArrayToPointerDecay(const ImplicitCastExpr* e) {
+    return e.getKind() == ArrayToPointerDecay;
+}
+
+public fn Expr* ImplicitCastExpr.getInner(const ImplicitCastExpr* e) { return e.inner; }
+
+fn SrcLoc ImplicitCastExpr.getStartLoc(const ImplicitCastExpr* e) {
+    return e.getInner().getStartLoc();
+}
+
+fn SrcLoc ImplicitCastExpr.getEndLoc(const ImplicitCastExpr* e) {
+    return e.getInner().getEndLoc();
+}
+
+fn void ImplicitCastExpr.printLiteral(const ImplicitCastExpr* e, StringBuf* out) {
+    e.inner.printLiteral(out);
+}
+
+fn void ImplicitCastExpr.print(const ImplicitCastExpr* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.space();
+    out.color(col_Calc);
+    out.add(e.getKind().name);
+    out.newline();
+    e.inner.print(out, indent + 1);
+}
+

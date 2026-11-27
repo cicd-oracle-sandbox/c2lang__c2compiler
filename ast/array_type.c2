@@ -1,0 +1,138 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import string_buffer { StringBuf }
+
+type ArrayTypeBits struct {
+    u32 : NumTypeBits;
+    u32 has_size : 1;       // if it has an sizeExpr
+    u32 is_incremental : 1;
+    u32 is_enum_index : 1;
+}
+static_assert(4, sizeof(ArrayTypeBits));
+
+public type ArrayType struct @(opaque) {
+    Type base;
+    QualType elem;
+    u32 size;       // set during analysis, number of elements
+    // Note: 4 bytes padding here on 64-bit systems
+    QualType[] index_type;
+}
+
+public fn ArrayType* ArrayType.create(Context* c,
+                                      QualType elem,
+                                      bool has_size,
+                                      u32 length,
+                                      bool is_enum_index,
+                                      QualType index_type)
+{
+    u32 size = sizeof(ArrayType) + is_enum_index * sizeof(QualType);
+    ArrayType* t = c.alloc(size);
+    t.base.init(Array);
+    t.base.arrayTypeBits.is_incremental = false;
+    t.base.arrayTypeBits.has_size = has_size;
+    t.elem = elem;
+    t.size = length;
+    if (is_enum_index) {
+        t.base.arrayTypeBits.is_enum_index = true;
+        t.index_type[0] = index_type;
+    }
+#if AstStatistics
+    Stats.addType(Array, size);
+#endif
+    return t;
+}
+
+public fn ArrayType* ArrayType.createIncremental(Context* c,
+                                                   QualType elem)
+{
+    ArrayType* t = c.alloc(sizeof(ArrayType));
+    t.base.init(Array);
+    t.base.arrayTypeBits.is_incremental = true;
+    t.base.arrayTypeBits.has_size = false;
+    t.elem = elem;
+    t.size = 0;
+#if AstStatistics
+    Stats.addType(Array, sizeof(ArrayType));
+#endif
+    return t;
+}
+
+//public fn Type* ArrayType.asType(ArrayType* t) { return &t.base; }
+
+public fn QualType ArrayType.getElemType(const ArrayType* t) { return t.elem; }
+
+/*
+public fn bool ArrayType.isIncremental(const ArrayType* t) {
+    return t.base.arrayTypeBits.is_incremental;
+}
+*/
+
+public fn u32 ArrayType.hasSize(const ArrayType* t) {
+    return t.base.arrayTypeBits.has_size;
+}
+
+public fn u32 ArrayType.getSize(const ArrayType* t) { return t.size; }
+
+public fn void ArrayType.setSize(ArrayType* t, u32 size) {
+    t.base.arrayTypeBits.has_size = true;
+    t.size = size;
+}
+
+public fn bool ArrayType.isEnumIndex(const ArrayType* t) {
+    return t.base.arrayTypeBits.is_enum_index;
+}
+
+public fn QualType ArrayType.getIndexType(const ArrayType* t) {
+    if (t.base.arrayTypeBits.is_enum_index) return t.index_type[0];
+    return QualType_Invalid;
+}
+
+fn void ArrayType.printPreName(const ArrayType* t, StringBuf* out) {
+    t.elem.print(out);
+}
+
+fn void ArrayType.printPostName(const ArrayType* t, StringBuf* out) {
+    out.add1('[');
+    if (t.base.arrayTypeBits.is_incremental) {
+        out.add1('+');
+    } else {
+        out.print("%d", t.size);
+    }
+    //if (t.isEnumIndex()) out.add(" e");
+    out.add1(']');
+}
+
+fn void ArrayType.print(const ArrayType* t, StringBuf* out) {
+    ArrayType* at = t.elem.getArrayTypeOrNil();
+    if (at) at.printPreName(out);
+    else t.elem.printInner(out, false, true, true);
+
+    t.printPostName(out);
+
+    if (at) at.printPostName(out);
+}
+
+fn void ArrayType.fullPrint(const ArrayType* t, StringBuf* out, u32 indent) {
+    out.indent(indent);
+    out.print("ArrayType [%p]", t);
+    if (t.base.arrayTypeBits.has_size) out.print(" size=%d", t.size);
+    out.newline();
+    t.elem.fullPrint(out, indent + 1);
+}
+

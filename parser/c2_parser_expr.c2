@@ -1,0 +1,951 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2_parser;
+
+//import ast_builder { Builder }
+import ast { * }
+import c2_prec { Prec }
+import constants { MaxMultiString }
+import src_loc { SrcLoc }
+import token { Kind, Token }
+
+import ctype { isupper }
+import string { memcpy }
+
+fn Expr* Parser.parseExpr(Parser* p) {
+    Expr* lhs = p.parseAssignmentExpression();
+    if (lhs.isInitlistAssignment())
+        return lhs;
+    return p.parseRHSOfBinaryExpression(lhs, Prec.Comma);
+}
+
+fn Expr* Parser.parseAssignmentExpression(Parser* p) {
+    Expr* lhs = p.parseCastExpr(false, false);
+    return p.parseRHSOfBinaryExpression(lhs, Prec.Assignment);
+}
+
+fn Expr* Parser.parseConstExpr(Parser* p) {
+    Expr* lhs = p.parseCastExpr(false, false);
+    return p.parseRHSOfBinaryExpression(lhs, Prec.Conditional);
+}
+
+fn Expr* Parser.parseInitExpr(Parser* p) {
+    return (p.tok.kind == LBrace) ? p.parseInitList() : p.parseAssignmentExpression();
+}
+
+const Prec[Kind] BinOpPrecLookup = {
+    [Comma]          = Comma,
+
+    [Equal]          = Assignment,
+    [StarEqual]      = Assignment,
+    [SlashEqual]     = Assignment,
+    [PercentEqual]   = Assignment,
+    [PlusEqual]      = Assignment,
+    [MinusEqual]     = Assignment,
+    [LessLessEqual]  = Assignment,
+    [GreaterGreaterEqual] = Assignment,
+    [AmpEqual]       = Assignment,
+    [CaretEqual]     = Assignment,
+    [PipeEqual]      = Assignment,
+
+    [Question]       = Conditional,
+
+    [PipePipe]       = LogicalAndOr,
+    [AmpAmp]         = LogicalAndOr,
+
+    [ExclaimEqual]   = Relational,
+    [EqualEqual]     = Relational,
+    [LessEqual]      = Relational,
+    [Less]           = Relational,
+    [Greater]        = Relational,
+    [GreaterEqual]   = Relational,
+
+    [Plus]           = Additive,
+    [Minus]          = Additive,
+
+    [Pipe]           = Bitwise,
+    [Caret]          = Bitwise,
+    [Amp]            = Bitwise,
+
+    [LessLess]       = Shift,
+    [GreaterGreater] = Shift,
+
+    [Percent]        = Multiplicative,
+    [Slash]          = Multiplicative,
+    [Star]           = Multiplicative,
+}
+
+// Note: all empty entries are also 0 (= BinaryOpcode.Multiply)
+const BinaryOpcode[Kind] BinOpTokenLookup = {
+    [Star]           = Multiply,
+    [Slash]          = Divide,
+    [Percent]        = Remainder,
+    [Plus]           = Add,
+    [Minus]          = Subtract,
+    [LessLess]       = ShiftLeft,
+    [GreaterGreater] = ShiftRight,
+    [Less]           = LessThan,
+    [Greater]        = GreaterThan,
+    [LessEqual]      = LessEqual,
+    [GreaterEqual]   = GreaterEqual,
+    [EqualEqual]     = Equal,
+    [ExclaimEqual]   = NotEqual,
+    [Amp]            = And,
+    [Caret]          = Xor,
+    [Pipe]           = Or,
+    [AmpAmp]         = LAnd,
+    [PipePipe]       = LOr,
+    [Equal]          = Assign,
+    [StarEqual]      = MulAssign,
+    [SlashEqual]     = DivAssign,
+    [PercentEqual]   = RemAssign,
+    [PlusEqual]      = AddAssign,
+    [MinusEqual]     = SubAssign,
+    [LessLessEqual]  = ShlAssign,
+    [GreaterGreaterEqual] = ShrAssign,
+    [AmpEqual]       = AndAssign,
+    [CaretEqual]     = XorAssign,
+    [PipeEqual]      = OrAssign,
+}
+
+fn Expr* Parser.parseRHSOfBinaryExpression(Parser* p, Expr* lhs, Prec minPrec) {
+    Prec nextTokPrec = BinOpPrecLookup[p.tok.kind];
+
+    SrcLoc colonLoc = 0;
+    while (1) {
+        if (nextTokPrec < minPrec) return lhs;
+
+        if (p.tok.kind == Comma) return lhs;
+
+        Token opToken = p.tok;
+        p.consumeToken();
+
+        Expr* ternaryMiddle = nil;
+        if (nextTokPrec == Conditional) {
+            if (p.tok.kind == Colon) {
+                p.error("expected expression after '?'");
+            } else {
+                ternaryMiddle = p.parseExpr();
+            }
+
+            if (p.tok.kind == Colon) {
+                colonLoc = p.tok.loc;
+                p.consumeToken();
+            }
+        }
+
+        if (p.tok.kind == LBrace && opToken.kind == Equal) {
+            Expr* rhs = p.parseInitList();
+            BinaryOpcode opcode = Assign;
+            return p.builder.actOnBinaryOperator(opToken.loc, opcode, lhs, rhs);
+        }
+
+        Expr* rhs = p.parseCastExpr(false, false);
+
+        Prec thisPrec = nextTokPrec;
+        nextTokPrec = BinOpPrecLookup[p.tok.kind];
+
+        bool isRightAssoc = (thisPrec == Conditional || thisPrec == Assignment);
+
+        if (thisPrec < nextTokPrec || (thisPrec == nextTokPrec && isRightAssoc)) {
+            rhs = p.parseRHSOfBinaryExpression(rhs, (Prec)(thisPrec + !isRightAssoc));
+
+            nextTokPrec = BinOpPrecLookup[p.tok.kind];
+        }
+
+        if (ternaryMiddle) {
+            lhs = p.builder.actOnConditionalOperator(opToken.loc,
+                                                     colonLoc,
+                                                     lhs,
+                                                     ternaryMiddle,
+                                                     rhs);
+        } else {
+            BinaryOpcode opcode = BinOpTokenLookup[opToken.kind];
+            lhs = p.builder.actOnBinaryOperator(opToken.loc, opcode, lhs, rhs);
+        }
+    }
+}
+
+const u8[Kind] CastExprTokenLookup = {
+    [Identifier] = 1,
+    [IntegerLiteral] = 2,
+    [FloatLiteral] = 3,
+    [CharLiteral] = 4,
+    [StringLiteral] = 5,
+    [LParen] = 6,
+    [Star] = 7,
+    [Tilde] = 7,
+    [Plus] = 7,
+    [Minus] = 7,
+    [Exclaim] = 7,
+    [Amp] = 7,
+    [PlusPlus] = 7,
+    [MinusMinus] = 7,
+    [KW_countof] = 8,
+    [KW_false] = 9,
+    [KW_true] = 9,
+    [KW_nil] = 10,
+    [KW_offsetof] = 11,
+    [KW_sizeof] = 12,
+    [KW_to_container] = 13,
+    [KW_bool] = 14,
+    [KW_char] = 14,
+    [KW_i8] = 14,
+    [KW_i16] = 14,
+    [KW_i32] = 14,
+    [KW_i64] = 14,
+    [KW_u8] = 14,
+    [KW_u16] = 14,
+    [KW_u32] = 14,
+    [KW_u64] = 14,
+    [KW_isize] = 14,
+    [KW_usize] = 14,
+    [KW_f32] = 14,
+    [KW_f64] = 14,
+    [KW_va_arg] = 15,
+}
+
+// Note: tried lookup table, was slower..
+fn UnaryOpcode convertTokenToUnaryOpcode(Kind kind) {
+    switch (kind) {
+    case Exclaim: return LNot;
+    case Star: return Deref;
+    case Amp: return AddrOf;
+    case PlusPlus:   return PreInc;
+    case Plus: return Plus;
+    case Minus: return Minus;
+    case MinusMinus: return PreDec;
+    case Tilde: return Not;
+    default:
+        assert(0);
+        break;
+    }
+    return PreInc;
+}
+
+fn Expr* Parser.parseOffsetOfMember(Parser* p) {
+    p.expectIdentifier();
+    SrcLoc loc = p.tok.loc;
+    u32 name_idx = p.tok.name_idx;
+    u32 name_len = p.tok.len;
+    p.consumeToken();
+    Expr* e = p.builder.actOnIdentifier(loc, name_idx, name_len);
+    for (;;) {
+        switch (p.tok.kind) {
+        case LSquare:
+            loc = p.tok.loc;
+            p.consumeToken();
+            Expr* idx = p.parseExpr();
+            u32 src_len = p.tok.loc + 1 - loc;
+            p.expectAndConsume(RSquare);
+            e = p.builder.actOnArraySubscriptExpr(loc, src_len, e, idx);
+            break;
+        case Dot:
+            e = p.parseImpureMemberExpr(e);
+            break;
+        default:
+            return e;
+        }
+    }
+}
+
+fn Expr* Parser.parseCastExpr(Parser* p, bool /*isUnaryExpr*/, bool /*isAddrOfOp*/) {
+    // This handles all of cast-expression, unary-expression, postfix-expression,
+    // and primary-expression.  We handle them together like this for efficiency
+    // and to simplify handling of an expression starting with a '(' token: which
+    // may be one of a parenthesized expression, cast-expression, compound literal
+    // expression, or statement expression.
+    //
+    // If the parsed tokens consist of a primary-expression, the cases below
+    // break out of the switch;  at the end we call ParsePostfixExpressionSuffix
+    // to handle the postfix expression suffixes.  Cases that cannot be followed
+    // by postfix exprs should return without invoking
+    // ParsePostfixExpressionSuffix.
+
+    Kind savedKind = p.tok.kind;
+    Expr* res = nil;
+    bool couldBeTemplateCall = false;
+
+    switch (CastExprTokenLookup[savedKind]) {
+    case 0: // other
+        p.error("expected expression");
+        break;
+    case 1: // Identifier
+        // parse all members in a single shot
+        res = p.parsePureMemberExpr();
+        couldBeTemplateCall = true;
+/*
+        // Make sure to pass down the right value for isAddressOfOperand.
+        if (isAddressOfOperand && isPostfixExpressionSuffixStart())
+            isAddressOfOperand = false;
+*/
+        break;
+    case 2: // IntegerLiteral
+        res = p.builder.actOnIntegerLiteral(p.tok.loc, p.tok.len, p.tok.int_value, p.tok.getRadix());
+        p.consumeToken();
+        break;
+    case 3: // FloatLiteral
+        BuiltinKind kind = p.tok.suffix_F ? Float32 : Float64;
+        res = p.builder.actOnFloatLiteral(p.tok.loc, p.tok.len, p.tok.float_value, p.tok.getRadix(), kind);
+        p.consumeToken();
+        break;
+    case 4: // CharLiteral
+        res = p.builder.actOnCharLiteral(p.tok.loc, p.tok.len, p.tok.char_value, p.tok.getRadix());
+        p.consumeToken();
+        break;
+    case 5: // StringLiteral
+        res = p.parseStringLiteral();
+        break;
+    case 6: // LParen
+        res = p.parseParenExpr();
+        break;
+    case 7: // Star, Tilde, Plus, Minus, Exclaim, Amp, PlusPlus, MinusMinus
+        SrcLoc loc = p.tok.loc;
+        p.consumeToken();
+        bool is_addrof_op = (savedKind == Amp);
+        res = p.parseCastExpr(false, is_addrof_op);
+        UnaryOpcode opcode = convertTokenToUnaryOpcode(savedKind);
+        return p.builder.actOnUnaryOperator(loc, opcode, res);
+    case 8: // KW_countof
+        return p.parseCountof();
+    case 9: // KW_false, KW_true
+        res = p.builder.actOnBooleanConstant(p.tok.loc, savedKind == KW_true);
+        p.consumeToken();
+        break;
+    case 10: // KW_nil
+        res = p.builder.actOnNilExpr(p.tok.loc);
+        p.consumeToken();
+        break;
+    case 11: // KW_offsetof
+        return p.parseOffsetOfExpr();
+    case 12: // KW_sizeof
+        return p.parseSizeof();
+    case 13: // KW_to_container
+        res = p.parseToContainerExpr();
+        break;
+    case 14: // builtin type
+        if (p.peekToken(1) == Dot) {
+            p.addImplicitImport(p.tok.name_idx, false);
+            res = p.parsePureMemberExpr();
+        } else {
+            p.error("expected expression");
+        }
+        break;
+    case 15: // KW_va_arg
+        res = p.parseVaArgExpr();
+        break;
+    }
+    return p.parsePostfixExprSuffix(res, couldBeTemplateCall);
+}
+
+fn Expr* Parser.parsePostfixExprSuffix(Parser* p, Expr* lhs, bool couldBeTemplateCall) {
+    while (1) {
+        switch (p.tok.kind) {
+        case Identifier:
+            return lhs;
+        case LParen:
+            // C2: can only be call expr?
+            lhs = p.parseCallExpr(lhs);
+            break;
+        case LSquare:
+            SrcLoc loc = p.tok.loc;
+            p.consumeToken();
+            Expr* idx = p.parseExpr();
+            if (p.tok.kind == Colon) {
+                // BitOffset <expr> : <expr>
+                SrcLoc colon_loc = p.tok.loc;
+                p.consumeToken();
+                Expr* rhs = p.parseExpr();
+                idx = p.builder.actOnBitOffsetExpr(colon_loc, idx, rhs);
+            }
+            u32 src_len = p.tok.loc + 1 - loc;
+            p.expectAndConsume(RSquare);
+            lhs = p.builder.actOnArraySubscriptExpr(loc, src_len, lhs, idx);
+            break;
+        case Dot:
+            lhs = p.parseImpureMemberExpr(lhs);
+            break;
+        case PlusPlus:
+            lhs = p.builder.actOnUnaryOperator(p.tok.loc, PostInc, lhs);
+            p.consumeToken();
+            break;
+        case MinusMinus:
+            lhs = p.builder.actOnUnaryOperator(p.tok.loc, PostDec, lhs);
+            p.consumeToken();
+            break;
+        case Less:
+            if (couldBeTemplateCall && p.isTemplateFunctionCall()) {
+                p.consumeToken();
+
+                TypeRefHolder ref.init();
+                p.parseTypeSpecifier(&ref);
+
+                p.expectAndConsume(Greater);
+                if (p.tok.kind != LParen) {
+                    p.error("missing argument list for template function call");
+                }
+                lhs = p.parseTemplateCallExpr(lhs, &ref);
+                break;
+            }
+            return lhs;
+        default:
+            return lhs;
+        }
+    }
+}
+
+fn Expr* Parser.parseCallExpr(Parser* p, Expr* func) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken(); // '('
+
+    ExprList args.init();
+
+    while (p.tok.kind != RParen) {
+        if (p.tok.kind == Identifier && p.peekToken(1) == Colon) {
+            SrcLoc nameLoc = p.tok.loc;
+            u32 name_idx = p.tok.name_idx;
+            p.consumeToken();  // name
+            p.consumeToken();  // ':'
+            Expr* inner = p.parseInitExpr();
+            Expr* arg = p.builder.actOnNamedArgument(nameLoc, name_idx, inner);
+            args.add(arg);
+        } else {
+            args.add(p.parseInitExpr());
+        }
+        if (p.tok.kind != Comma) break;
+        p.consumeToken();
+    }
+    SrcLoc endLoc = p.tok.loc + 1;
+    p.expectAndConsume(RParen);
+    Expr* res = p.builder.actOnCallExpr(loc, endLoc, func, args.getExprs(), args.size());
+    args.free();
+    return res;
+}
+
+fn Expr* Parser.parseTemplateCallExpr(Parser* p, Expr* func, const TypeRefHolder* ref) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken(); // '('
+
+    ExprList args.init();
+
+    while (p.tok.kind != RParen) {
+
+        args.add(p.parseExpr());
+
+        if (p.tok.kind != Comma) break;
+        p.consumeToken();
+    }
+    SrcLoc endLoc = p.tok.loc + 1;
+    p.expectAndConsume(RParen);
+    Expr* res = p.builder.actOnTemplateCallExpr(loc, endLoc, func, args.getExprs(), args.size(), ref);
+    args.free();
+    return res;
+}
+
+fn Expr* Parser.parseImpureMemberExpr(Parser* p, Expr* base) {
+    // Create simple `MemberExpr` for all parts
+    for (;;) {
+        p.consumeToken();   // dot
+        p.expectIdentifier();
+        base = p.builder.actOnMemberExpr(base, 0, 0, p.tok.loc, p.tok.name_idx);
+        p.consumeToken();
+        if (p.tok.kind != Dot) break;
+    }
+    return base;
+}
+
+fn Expr* Parser.parsePureMemberExpr(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    u32 name_idx = p.tok.name_idx;
+    u32 name_len = p.tok.len;
+    p.consumeToken();
+    if (p.tok.kind != Dot) return p.builder.actOnIdentifier(loc, name_idx, name_len);
+    p.consumeToken();  // Dot
+    p.expectIdentifier();
+    Expr* lhs = p.builder.actOnMemberExpr(nil, name_idx, name_len, p.tok.loc, p.tok.name_idx);
+    p.consumeToken();
+    if (p.tok.kind != Dot) return lhs;
+    return p.parseImpureMemberExpr(lhs);
+}
+
+fn Expr* Parser.parseStringLiteral(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    u32 src_len = p.tok.len;
+    u32 idx = p.tok.text_idx;
+    u32 len = p.tok.text_len;
+    p.consumeToken();
+    // concatenate multi-strings
+    if (p.tok.kind == StringLiteral) {
+        char* tmp = p.multi_string;
+        const char* p1 = p.pool.idx2str(idx);
+        if (len > MaxMultiString) {
+            p.error("multi-string literal too long");
+        }
+        memcpy(tmp, p1, len);
+
+        while (p.tok.kind == StringLiteral) {
+            const char* p2 = p.pool.idx2str(p.tok.text_idx);
+            usize len2 = p.tok.text_len;
+            if (len + len2 > MaxMultiString) {
+                p.error("multi-string literal too long");
+            }
+            memcpy(tmp + len, p2, len2);
+            len += len2;
+            src_len = p.tok.loc + p.tok.len - loc;
+            p.consumeToken();
+        }
+        idx = p.pool.add(tmp, len, true);
+    }
+    return p.builder.actOnStringLiteral(loc, src_len, idx, len, true);
+}
+
+fn Expr* Parser.parseParenExpr(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    if (p.parseAsCastType(0, RParen)) {
+        TypeRefHolder ref.init();
+        p.parseTypeSpecifier(&ref);
+        p.expectAndConsume(RParen);
+        if (p.tok.kind == LBrace) {
+            // compound literal
+            p.error("Compound literals are not supported");
+        } else {
+            // C cast expression
+            if (ref.isArray()) p.error("array types are not allowed here");
+            Expr* expr = p.parseCastExpr(false, false);
+            u32 src_len = p.prev_tok.loc + p.prev_tok.len - loc;
+            return p.builder.actOnExplicitCast(loc, src_len, &ref, expr, true);
+        }
+    }
+
+    Expr* res = p.parseExpr();
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+
+    return p.builder.actOnParenExpr(loc, src_len, res);
+}
+
+fn bool Parser.isTemplateFunctionCall(Parser* p) {
+    assert(p.tok.kind == Less);
+    // check if tokens after < could be type, followed by >(
+    // longest token line could be mod.type**
+
+    // type must start with either a qualifier or an identifier
+    //   or a builtin not followed by a dot.
+    Kind kind = p.peekToken(1);
+    if (kind != Identifier) {
+        if (kind.isQualifier()) return true;
+        return kind.isTypeKeyword() && (p.peekToken(2) != Dot);
+    }
+
+    u32 stars = 0;
+    for (u32 ahead = 2; ahead < 8; ahead++) {
+        switch (p.peekToken(ahead)) {
+        case Identifier:
+            if (stars) return false;
+            break;
+        case Star:
+            stars++;
+            break;
+        case Dot:
+            break;
+        case Greater:
+            return p.peekToken(ahead + 1) == LParen;
+        case KW_const:
+        case KW_volatile:
+            return true;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+fn Expr* Parser.parseSizeof(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    p.expectAndConsume(LParen);
+
+    Expr* res = nil;
+    if (p.parseSizeofAsType()) {
+        // argument is unambiguously a type
+        SrcLoc type_loc = p.tok.loc;
+        TypeRefHolder ref.init();
+        p.parseTypeSpecifier(&ref);
+        u32 src_len = p.prev_tok.loc + p.prev_tok.len - type_loc;
+        res = p.builder.actOnTypeExpr(type_loc, src_len, &ref);
+    } else {
+        // argument is an expression or an ambiguous name, parse as expression
+        res = p.parseExpr();
+    }
+
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+
+    return p.builder.actOnBuiltinExpr(loc, src_len, res, Sizeof);
+}
+
+fn Expr* Parser.parseCountof(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    p.expectAndConsume(LParen);
+
+    // TODO parse as TypeRefholder (can have module.prefix and array index
+    Expr* res = p.parseFullIdentifier();
+    res = p.parsePostfixExprSuffix(res, false);
+
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+    return p.builder.actOnBuiltinExpr(loc, src_len, res, Countof);
+}
+
+fn Expr* Parser.parseInitValue(Parser* p) {
+    switch (p.tok.kind) {
+    case LBrace:
+        return p.parseInitList();
+    case Dot:
+        return p.parseFieldDesignator();
+    case LSquare:
+        return p.parseArrayDesignator();
+    default:
+        return p.parseAssignmentExpression();
+    }
+}
+
+fn Expr* Parser.parseInitList(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.expectAndConsume(LBrace);
+
+    ExprList values.init();
+
+    while (p.tok.kind != RBrace) {
+        Expr* e = p.parseInitValue();
+        values.add(e);
+        if (p.tok.kind == Comma) {
+            p.consumeToken();
+        } else {
+            break;
+        }
+    }
+
+    // check for missing comma between array inits. eg: {} {}
+    if (p.tok.kind == LBrace) p.expect(Comma); // always gives error
+
+    SrcLoc endLoc = p.tok.loc;
+    p.consumeRBrace();
+    Expr* e = (Expr*)p.builder.actOnInitList(loc, endLoc, values.getExprs(), values.size());
+    values.free();
+    return e;
+}
+
+fn Expr* Parser.parseFieldDesignator(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();   // .
+    p.expectIdentifier();
+    u32 field = p.tok.name_idx;
+    p.consumeToken();
+
+    p.expectAndConsume(Equal);
+    Expr* value = p.parseInitExpr();
+
+    return p.builder.actOnFieldDesignatedInit(loc, field, value);
+}
+
+fn Expr* Parser.parseArrayDesignator(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();   // '['
+
+    ArrayDesignatedInitExprKind kind = Single;
+    Expr* expr1 = nil;
+    Expr* expr2 = nil;
+    if (p.tok.kind != Ellipsis && p.tok.kind != Colon) {
+        // TODO: should be constant-expression
+        expr1 = p.parseAssignmentExpression();
+    }
+    if (p.tok.kind == Ellipsis || p.tok.kind == Colon) {
+        kind = p.tok.kind == Colon ? Slice : Range;
+        p.consumeToken();
+        if (p.tok.kind != RSquare) {
+            expr2 = p.parseConstExpr();
+        }
+    }
+    p.expectAndConsume(RSquare);
+    p.expectAndConsume(Equal);
+
+    Expr* initValue = p.parseInitExpr();
+    return p.builder.actOnArrayDesignatedInit(loc, expr1, expr2, initValue, kind);
+}
+
+fn Expr* Parser.parseOffsetOfExpr(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    p.expectAndConsume(LParen);
+
+    // TODO use TypeRefHolder (modified version to only allow identifiers)
+    Expr* structExpr = p.parseFullIdentifier();
+
+    p.expectAndConsume(Comma);
+
+    Expr* member = p.parseOffsetOfMember();
+
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+
+    return p.builder.actOnOffsetOfExpr(loc, src_len, structExpr, member);
+}
+
+fn Expr* Parser.parseToContainerExpr(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    p.expectAndConsume(LParen);
+
+    Expr* structExpr = p.parseFullIdentifier();
+
+    p.expectAndConsume(Comma);
+
+    Expr* member = p.parseOffsetOfMember();
+
+    p.expectAndConsume(Comma);
+
+    Expr* pointer = p.parseExpr();
+
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+
+    return p.builder.actOnToContainerExpr(loc, src_len, structExpr, member, pointer);
+}
+
+fn Expr* Parser.parseVaArgExpr(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    p.expectAndConsume(LParen);
+
+    Expr* expr = p.parseExpr();
+
+    p.expectAndConsume(Comma);
+
+    TypeRefHolder ref.init();
+    p.parseTypeSpecifier(&ref);
+
+    u32 src_len = p.tok.loc + 1 - loc;
+    p.expectAndConsume(RParen);
+
+    return p.builder.actOnVaArgExpr(loc, src_len, &ref, expr);
+}
+
+// Syntax:
+//   identifier
+//   identifier.identifier
+//   identifier.identifier.identifier etc
+fn Expr* Parser.parseFullIdentifier(Parser* p) {
+    p.expectIdentifier();
+    return p.parsePureMemberExpr();
+}
+
+/*
+    parsing sizeof() is nasty, since the inner argument can be either an Expr or a Type!
+
+    The reason we test brackets [] inside a sizeof is that it is potentially ambiguous;
+    it can be an array (eg Foo[2]) or a subscript expression (a[2]). We assume Foo to be
+    a type, but it could be a global constant, in which case an error will be generated later.
+
+    i8,u8,.      - type
+    X*           - type
+    Foo<..>      - type
+    test.Foo<..> - type
+    Foo          - identifier (upper case, can be constant or type)
+    f            - identifier (lower case, can be a system type)
+    test.Foo     - member (upper case, can be constant or type)
+    f.a          - member (lower case, can be a system type with a module prefix)
+    test.f.a     - member (lower case)
+    Foo[..]      - can be global constant array element or type array, assume type array
+    test.Foo[..] - can be global constant array element or module prefixed type array, assume module prefixed type array
+    a[..]        - subscript expression, yet could be system type array
+    test.a[..]   - subscript expression, yet could be system type array with a module prefix
+    Foo.a        - struct field (need instantiation, should accept as extension)
+                   could also be a member expression of a global constant
+    test.Foo.a   - same as above with module prefix
+    a*)          - system type, will give error later if not a system type
+    test.a*)     - system type with module prefix, will give error later if not
+*/
+fn bool Parser.parseSizeofAsType(Parser* p) {
+    // type must start with either a qualifier or an identifier
+    //   or a builtin not followed by a dot.
+    Kind kind = p.tok.kind;
+    if (kind != Identifier) {
+        if (kind.isQualifier()) return true;
+        return kind.isTypeKeyword() && (p.peekToken(1) != Dot);
+    }
+    Token t2 = p.tok;
+    // parse potential member expression
+    // module name space is flat so `a.b.c` cannot be a type
+    u32 ahead = 1;
+    if (p.peekToken(ahead) == Dot) {
+        if (p.peekToken2(ahead + 1, &t2) != Identifier) return false;
+        ahead += 2;
+        if (p.peekToken(ahead) == Dot) return false;
+    }
+
+    i32 stars = 0;
+    for (;; ahead++) {
+        switch (p.peekToken(ahead)) {
+        case RParen:
+            if (stars) return true;
+            // ambiguous: could be a global constant or a type name
+            return false;   // resolve in analyser
+        case LSquare:
+            if (stars) return true;  // sizeof(MyType*[...])
+            // if identifier is not uppercase, argument is not a type
+            // this assumption is erroneous for sizeof(pid_t[2])
+            if (!isupper(*p.pool.idx2str(t2.name_idx))) return false;
+            // ambiguous: could be a global constant array element or an array type
+            return true;    // assume array type
+        case Star:
+            if (stars) return true;  // sizeof(a**...)
+            stars++;
+            break;
+        case Less:
+            // if identifier is not uppercase, argument is not a type
+            if (!isupper(*p.pool.idx2str(t2.name_idx))) return false;
+            // ambiguous: could be a parametric type or a comparison with a global constant
+            return true;   // assume parametric type
+        case KW_const:
+        case KW_volatile:
+            return true;
+        default:
+            return false;
+        }
+    }
+}
+
+/*
+   Type parser for C style casts and compound literals.
+   Accepts all type specifications, including parametric types.
+   Return the number of tokens until and including the closing token.
+   Return 0 if the expression is not a type specification.
+   Ambiguities are resolved by checking the token after ')'.
+   Array syntax is rejected if `brackets` is nil, otherwise `*brackets` is
+   set if an array type is parsed.
+*/
+fn u32 Parser.parseAsCastType(Parser* p, u32 ahead, Kind close_tok) {
+    Token t2 = p.tok;
+    bool ambiguous = true;
+    for (;;) {
+        Kind kind = p.peekToken2(ahead, &t2);
+        ahead++;
+        if (kind.isTypeKeyword() && (p.peekToken(ahead) != Dot)) {
+            // builtin type, non ambiguous
+            ambiguous = false;
+            break;
+        }
+        if (kind.isQualifier()) {
+            // const and volatile qualifiers must introduce a type
+            ambiguous = false;
+            continue;
+        }
+        // must have an identifier or a member expression
+        // but still potentially ambiguous.
+        if (kind != Identifier)
+            return 0;
+        break;
+    }
+
+    // module name space is flat so `a.b.c` cannot be a type
+    if (p.peekToken(ahead) == Dot) {
+        if (p.peekToken2(ahead + 1, &t2) != Identifier) return 0;
+        ahead += 2;
+        if (p.peekToken(ahead) == Dot) return 0;
+    }
+
+    i32 stars = 0;
+    for (;;) {
+        switch (p.peekToken(ahead)) {
+        case Star:
+            if (stars < 0) return 0;
+            if (stars > 0) ambiguous = false;
+            stars++;
+            ahead++;
+            break;
+        case RParen:
+            if (close_tok != RParen)
+                return 0;
+            ahead++;
+            if (!ambiguous) return ahead;
+            // disambiguate depending on the next token
+            switch (p.peekToken(ahead)) {
+            case Identifier:
+            case IntegerLiteral:
+            case FloatLiteral:
+            case CharLiteral:
+            case StringLiteral:
+            case Tilde:
+            case Exclaim:
+            case KW_countof:
+            case KW_false:
+            case KW_true:
+            case KW_nil:
+            case KW_offsetof:
+            case KW_sizeof:
+            case KW_to_container:
+            case LBrace:
+                return ahead;
+            case PlusPlus:   // ambiguous: (x)++
+            case MinusMinus: // ambiguous: (x)--
+            case LParen:     // ambiguous: (func)(args)
+            case Amp:        // ambiguous: (func)&b
+            case Plus:       // ambiguous: (func)+b
+            case Minus:      // ambiguous: (func)-b
+            case Star:       // ambiguous: (func)*b
+                // for ambiguous combinations, rely on identifier case
+                // (A)(...) is a cast, (a)(...) is a function call
+                if (!isupper(p.pool.idx2str(t2.name_idx)[0]))
+                    return 0;
+                return ahead;
+            default:
+                break;
+            }
+            return 0;
+        case LSquare:
+            // skip expression
+            ahead = p.skipArray(ahead + 1, RSquare);
+            if (!ahead) return 0;
+            stars = -1; // no longer accept stars
+            break;
+        case Less:
+            // parametric type X<type>
+            ahead = p.parseAsCastType(ahead, Greater);
+            if (!ahead)
+                return 0;
+            stars = 0;
+            break;
+        case Greater:
+            if (close_tok != Greater)
+                return 0;
+            ahead++;
+            return ahead;
+        case KW_const:
+        case KW_volatile:
+            ambiguous = false;
+            ahead++;
+            break;
+        default:
+            return 0;
+        }
+    }
+}

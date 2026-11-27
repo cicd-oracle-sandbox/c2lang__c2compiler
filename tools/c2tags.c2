@@ -1,0 +1,330 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module refs_main;
+
+import c2refs { Dest, RefUsesFn, Refs }
+import constants { Refs_filename }
+import file_utils { Pathname }
+import refs_finder { Finder }
+import string_pool { StringPool }
+import utils;
+
+import c_errno { errno }
+import stdio { printf, fprintf, stderr }
+import stdlib { atoi, malloc, free, exit, EXIT_FAILURE }
+import string { memcpy, strerror }
+#if MeasureTime
+import sys_time { Timeval, gettimeofday }
+#endif
+
+type Options struct {
+    const char* target;
+    const char* symbolname;
+    const char* filename;
+    u32 offset; // when use_offsets
+    u32 line;
+    u16 column;
+    bool reverse;
+    bool dump;
+    bool verbose;
+    bool use_offsets;
+}
+
+Options opts;
+Results results;
+u32 count;
+
+#if MeasureTime
+public fn u64 getCurrentTime() {
+    Timeval tv;
+    gettimeofday(&tv, nil);
+    u64 now64 = (u64)tv.tv_sec;
+    now64 *= 1000000;
+    now64 += tv.tv_usec;
+    return now64;
+}
+#endif
+
+fn void usage(const char* me)  @(noreturn) {
+    printf("Usage: %s [mode] <opts>\n", me);
+    printf("  Modes:\n");
+    printf("    [name]                  find definition of symbol specified by name\n");
+    printf("    [file] [line] [col]     find definition of symbol specify by position\n");
+    printf("  Options:\n");
+    printf("    -d                      dump refs\n");
+    printf("    -D                      dump refs (verbose)\n");
+    printf("    -o                      use offset instead of line/col (both on input+output)\n");
+    printf("    -r                      find uses of symbol (specified by name/position)\n");
+    printf("    -t [target]             use [target]\n");
+    exit(EXIT_FAILURE);
+}
+
+type Result struct {
+    u32 filename;
+    u32 line;
+    u32 col;
+}
+
+type Results struct {
+    u32 count;
+    u32 capacity;
+    Result* results;
+
+    StringPool* pool;
+}
+
+fn void Results.init(Results* r) {
+    r.count = 0;
+    r.resize(32);
+    r.pool = StringPool.create(4096, 1024);
+}
+
+fn void Results.free(Results* r) {
+    free(r.results);
+    r.pool.free();
+}
+
+fn void Results.resize(Results* r, u32 capacity) {
+    r.capacity = capacity;
+    Result* res = malloc(capacity * sizeof(Result));
+    if (r.count) {
+        memcpy(res, r.results, r.count * sizeof(Result));
+        free(r.results);
+    }
+    r.results = res;
+}
+
+fn void Results.add(Results* r, const char* filename, u32 line, u32 col) {
+    u32 name_idx = r.pool.addStr(filename, true);
+
+    for (u32 i=0; i<r.count; i++) {
+        const Result* res = &r.results[i];
+        if (res.filename == name_idx && res.line == line && res.col == col) return;
+    }
+
+    if (r.count == r.capacity) r.resize(r.capacity * 2);
+
+    Result* res = &r.results[r.count];
+    res.filename = name_idx;
+    res.line = line;
+    res.col = col;
+    r.count++;
+}
+
+fn u32 Results.getCount(const Results* r) {
+    return r.count;
+}
+
+fn void Results.print(const Results* r) {
+    for (u32 i=0; i<r.count; i++) {
+        const Result* res = &r.results[i];
+        if (opts.use_offsets) {
+            printf("found %s %d\n", r.pool.idx2str(res.filename), res.line);
+        } else {
+            printf("found %s %d %d\n", r.pool.idx2str(res.filename), res.line, res.col);
+        }
+    }
+}
+
+fn void parse_options(i32 argc, const char** argv) {
+    const char*[3] args = { nil }
+    u32 pos_count = 0;
+    i32 i= 1;
+    while (i<argc) {
+        const char* arg = argv[i];
+        if (arg[0] == '-') {
+            switch (arg[1]) {
+            case 'd':
+                opts.dump = 1;
+                break;
+            case 'D':
+                opts.dump = 1;
+                opts.verbose = 1;
+                break;
+            case 'o':
+                opts.use_offsets = true;
+                break;
+            case 'r':
+                opts.reverse = 1;
+                break;
+            case 't':
+                i++;
+                if (i == argc) usage(argv[0]);
+                opts.target = argv[i];
+                break;
+            default:
+                usage(argv[0]);
+                break;
+            }
+        } else {
+            if (pos_count >= 3) usage(argv[0]);
+            args[pos_count] = arg;
+            pos_count++;
+        }
+        i++;
+    }
+    if (opts.dump) {
+        if (pos_count != 0) usage(argv[0]);
+        return;
+    }
+    switch (pos_count) {
+    case 1:
+        opts.symbolname = args[0];
+        break;
+    case 2:
+        if (!opts.use_offsets) usage(argv[0]);
+        opts.filename = args[0];
+        opts.offset = (u32)atoi(args[1]);
+        break;
+    case 3:
+        opts.filename = args[0];
+        opts.line = (u32)atoi(args[1]);
+        opts.column = (u16)atoi(args[2]);
+        break;
+    default:
+        usage(argv[0]);
+        break;
+    }
+}
+
+fn void use_fn(void* arg, const Dest* res) {
+    const utils.PathInfo* info = arg;
+
+    if (res.filename) {
+        count++;
+
+        // TODO extract to info
+        Pathname fullname;
+        const char* filename = res.filename;
+        if (info.hasSubdir()) {
+            fullname.init(info.root2orig, filename);
+            filename = fullname.path;
+        }
+        if (opts.use_offsets) {
+            printf("found %s %d\n", filename, res.offset);
+        } else {
+            printf("found %s %d %d\n", filename, res.line, res.col);
+        }
+    }
+}
+
+fn void use_fn_multi(void* arg, const Dest* res) {
+    const utils.PathInfo* info = arg;
+
+    if (res.filename) {
+        Pathname fullname;
+        const char* filename = res.filename;
+        if (opts.filename && info.hasSubdir()) {
+            fullname.init(info.root2orig, filename);
+            filename = fullname.path;
+        }
+        results.add(filename, res.line, res.col);
+    }
+}
+
+fn bool check_refs(const char* refsfile, RefUsesFn on_result, void* arg) {
+    Refs* r = Refs.load(refsfile, opts.use_offsets);
+    if (!r) {
+        fprintf(stderr, "error loading %s: %s\n", refsfile, strerror(errno));
+        return false;
+    }
+
+    if (opts.dump) {
+        r.dump(opts.verbose);
+        r.free();
+        return true;
+    }
+    if (opts.filename) {    // lookup <file line col> or <file offset>
+        Dest origin = { .filename=opts.filename, .col=opts.column }
+        if (opts.use_offsets) origin.offset = opts.offset;
+        else origin.line = opts.line;
+
+        if (opts.reverse) {
+            u16 old_len = 0;
+            r.findRefUses(&origin, on_result, arg, &old_len);
+        } else {
+            Dest result = r.findRef(&origin);
+            on_result(arg, &result);
+        }
+    } else {    // lookup <symbol>
+        if (opts.reverse) {
+            r.findSymbolUses(opts.symbolname, on_result, arg);
+        } else {
+            Dest result = r.findSymbol(opts.symbolname);
+            on_result(arg, &result);
+        }
+    }
+    r.free();
+    return true;
+}
+
+public fn i32 main(i32 argc, const char** argv)
+{
+    parse_options(argc, argv);
+
+    utils.PathInfo info = { }
+    if (!utils.findProjectDir(&info)) {
+        fprintf(stderr, "cannot find C2 root dir\n");
+        return -1;
+    }
+    //printf("P1 [%s]\n", info.root2orig);
+    //printf("P2 [%s]\n", info.orig2root);
+    Pathname fullname;
+    if (opts.filename && info.hasSubdir()) {
+        fullname.init(info.orig2root, opts.filename);
+        opts.filename = fullname.path;
+    }
+#if MeasureTime
+    u64 t1 = getCurrentTime();
+#endif
+    Finder* finder = Finder.create(constants.output_dir, Refs_filename);
+    u32 refsfile_count = finder.search(opts.target);
+
+    if (refsfile_count == 0) {
+        fprintf(stderr, "no %s files found\n", Refs_filename);
+        return -1;
+    }
+
+    results.init();
+
+    RefUsesFn callback = refsfile_count > 1 ? use_fn_multi : use_fn;
+
+    bool ok = true;
+    for (u32 i=0; i<refsfile_count; i++) {
+        ok &= check_refs(finder.get(i), callback, &info);
+        if (!opts.reverse && results.getCount()) break;
+    }
+
+#if MeasureTime
+    u64 t2 = getCurrentTime();
+    printf("  took %lu usec\n", t2 - t1);
+#endif
+    if (refsfile_count > 1) {
+        count = results.getCount();
+        results.print();
+    }
+
+    if (opts.reverse) {
+        printf("%d uses\n", count);
+    } else {
+        if (count == 0) printf("no result found\n");
+    }
+
+    results.free();
+    finder.free();
+    return ok ? 0 : -1;
+}
+

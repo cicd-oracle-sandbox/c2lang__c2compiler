@@ -1,0 +1,37 @@
+// @recipe bin
+    $warnings no-unused
+    $config FOO
+    $config BAR=10
+    $backend c no-build
+
+// @file{file1}
+module test;
+import stdio { * }
+
+public fn i32 main() {
+#ifdef FOO
+    printf("FOO defined\n");
+#endif
+#if BAR == 10
+    printf("BAR is 10\n");
+#else
+    printf("BAR is NOT 10\n");
+#endif
+
+#ifdef UNKNOWN
+    printf("UNNKOWN defined\n");
+#else
+    printf("UNNKOWN undefined\n");
+#endif
+    return 0;
+}
+
+// @expect{atleast, cgen/build.c}
+
+int main(void)
+{
+    printf("FOO defined\n");
+    printf("BAR is 10\n");
+    printf("UNNKOWN undefined\n");
+    return 0;
+}

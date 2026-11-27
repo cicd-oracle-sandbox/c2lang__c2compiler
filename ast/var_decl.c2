@@ -1,0 +1,438 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type VarDeclKind enum u8 (const char* const name) {
+    GlobalVar       : { "global" },
+    LocalVar        : { "local" },
+    FunctionParam   : { "parameter" },
+    StructMember    : { "member" },
+    EnumValue       : { "enum-value" },
+}
+
+type AutoAttr enum u32 {
+    None,
+    File,
+    Line,
+    Func,
+    Expr,
+}
+
+public type FormatAttr enum u8 {
+    None,
+    Printf,
+    Scanf,
+}
+
+type VarDeclBits struct @(packed) {
+    u32 : NumDeclBits;
+    VarDeclKind kind : 3;
+    u32 is_bitfield : 1;   // bitfield is struct-member
+    u32 has_init : 1;      // global and local variables
+    u32 is_static : 1;     // local variables only
+    u32 has_init_call : 1; // local variables only
+    u32 attr_weak : 1; // globals only
+    u32 addr_used : 1;
+    AutoAttr auto_attr : 3;  // for parameters only
+    FormatAttr format_attr : 2; // for parameters only
+    u32 is_tlocal : 1;  // local or global variables with thread local storage
+}
+static_assert(4, sizeof(VarDeclBits));
+
+public type BitFieldLayout struct {
+    u8 bit_width;
+    u8 bit_offset;
+}
+
+type BitFieldInfo struct {
+    Expr* expr;
+    SrcLoc loc;
+    BitFieldLayout layout;
+    // u16 pad
+}
+static_assert(16, sizeof(BitFieldInfo));
+
+type VarDeclInit struct {
+    Expr* expr;
+    SrcLoc loc;
+    // u32 pad
+}
+static_assert(16, sizeof(VarDeclInit));
+
+public type VarDecl struct @(opaque) {
+    Decl base;
+    TypeRef typeRef;    // Note: variable size due to tail allocs!
+    // optional VarDeclInit / BitFieldInfo
+}
+
+public fn VarDecl* VarDecl.create(Context* c,
+                                  VarDeclKind kind,
+                                  u32 name,
+                                  SrcLoc loc,
+                                  bool is_public,
+                                  const TypeRefHolder* ref,
+                                  u32 ast_idx,
+                                  SrcLoc assignLoc,
+                                  bool has_embed,
+                                  Expr* initValue)
+{
+    u32 size = sizeof(VarDecl) + ref.getExtraSize();
+    // Note: assignLoc only used for initValue
+    // Note: for incremental arrays, the initValue will be set later
+    if (initValue || ref.isIncrArray() || has_embed) size += sizeof(VarDeclInit);
+    assert (kind != StructMember);
+
+    VarDecl* d = c.alloc(size);
+    d.base.init(Variable, name, loc, is_public, QualType_Invalid, ast_idx);
+    d.base.varDeclBits.kind = kind;
+    d.typeRef.init(ref);
+    if (initValue || has_embed) {
+        d.base.varDeclBits.has_init = 1;
+        VarDeclInit* init = d.typeRef.getPointerAfter();
+        init.expr = initValue;
+        init.loc = assignLoc;
+    }
+#if AstStatistics
+    Stats.addDecl(Variable, size);
+#endif
+    return d;
+}
+
+public fn VarDecl* VarDecl.createStructMember(Context* c,
+                                                u32 name,
+                                                SrcLoc loc,
+                                                bool is_public,
+                                                const TypeRefHolder* ref,
+                                                u32 ast_idx,
+                                                Expr* bitfield)
+{
+    u32 size = sizeof(VarDecl) + ref.getExtraSize();
+    if (bitfield) size += sizeof(BitFieldInfo); // see above
+
+    VarDecl* d = c.alloc(size);
+    d.base.init(Variable, name, loc, is_public, QualType_Invalid, ast_idx);
+    d.base.varDeclBits.kind = StructMember;
+    if (name == 0) d.base.setUsed();  // set unnamed member to used
+    d.typeRef.init(ref);
+    if (bitfield) {
+        d.base.varDeclBits.is_bitfield = 1;
+        BitFieldInfo* info = d.typeRef.getPointerAfter();
+        info.expr = bitfield;
+        info.loc = loc;
+        info.layout.bit_width = 0;
+        info.layout.bit_offset = 0;
+    }
+#if AstStatistics
+    Stats.addDecl(Variable, size);
+#endif
+    return d;
+}
+
+fn VarDecl* VarDecl.instantiate(const VarDecl* vd, Instantiator* inst)
+{
+    bool matches = vd.typeRef.matchesTemplate(inst.template_name);
+    u32 extra = matches ? inst.ref.getExtraSize() : vd.typeRef.getExtraSize();
+    //TODO handle embed
+    if (vd.base.varDeclBits.has_init) extra += sizeof(VarDeclInit);
+    if (vd.base.varDeclBits.is_bitfield) extra += sizeof(BitFieldInfo);
+    u32 size = sizeof(VarDecl) + extra;
+
+    VarDecl* vd2 = inst.c.alloc(size);
+    vd2.base = vd.base;
+    vd2.typeRef.instantiate(&vd.typeRef, inst);
+
+    if (vd.base.varDeclBits.has_init) {
+        VarDeclInit* init1 = vd.typeRef.getPointerAfter();
+        VarDeclInit* init2 = vd2.typeRef.getPointerAfter();
+        init2.loc = init1.loc;
+        init2.expr = init1.expr.instantiate(inst);
+    }
+    if (vd.base.varDeclBits.is_bitfield) {
+        BitFieldInfo* info1 = vd.typeRef.getPointerAfter();
+        BitFieldInfo* info2 = vd2.typeRef.getPointerAfter();
+        info2.loc = info1.loc;
+        info2.expr = info1.expr.instantiate(inst);
+    }
+#if AstStatistics
+    Stats.addDecl(Variable, size);
+#endif
+    return vd2;
+}
+
+public fn u32 VarDecl.getNameIdx(const VarDecl* d) {
+    return d.base.name_idx;
+}
+
+public fn Decl* VarDecl.asDecl(VarDecl* d) {
+    return &d.base;
+}
+
+public fn SrcLoc VarDecl.getLoc(const VarDecl* d) {
+    return d.base.loc;
+}
+
+fn QualType VarDecl.getType(const VarDecl* d) {
+    return d.base.qt;
+}
+
+// for struct-members
+fn u32 VarDecl.getOffset(const VarDecl* d) {
+    return d.base.offset;
+}
+
+// for struct-members
+public fn void VarDecl.setOffset(VarDecl* d, u32 offset) {
+    d.base.offset = (u16)offset;
+}
+
+public fn VarDeclKind VarDecl.getKind(const VarDecl* d) {
+    return d.base.varDeclBits.kind;
+}
+
+public fn bool VarDecl.isGlobal(const VarDecl* d) {
+    return d.getKind() == GlobalVar;
+}
+
+public fn bool VarDecl.isLocal(const VarDecl* d) {
+    return d.getKind() == LocalVar;
+}
+
+public fn bool VarDecl.isParameter(const VarDecl* d) {
+    return d.getKind() == FunctionParam;
+}
+
+fn bool VarDecl.isStructMember(const VarDecl* d) {
+    return d.getKind() == StructMember;
+}
+
+public fn bool VarDecl.isEnumValue(const VarDecl* d) {
+    return d.getKind() == EnumValue;
+}
+
+fn bool VarDecl.isBitField(const VarDecl* d) {
+    return d.base.varDeclBits.is_bitfield;
+}
+
+public fn bool VarDecl.isAddrUsed(const VarDecl* d) {
+    return d.base.varDeclBits.addr_used;
+}
+
+public fn void VarDecl.setAddrUsed(VarDecl* d) {
+    d.base.varDeclBits.addr_used = 1;
+}
+
+public fn TypeRef* VarDecl.getTypeRef(VarDecl* d) { return &d.typeRef; }
+
+public fn SrcLoc VarDecl.getAssignLoc(const VarDecl* d) {
+    if (d.base.varDeclBits.has_init) {
+        VarDeclInit* init = d.typeRef.getPointerAfter();
+        return init.loc;
+    }
+    return 0;
+}
+
+public fn bool VarDecl.hasInit(const VarDecl* d) {
+    return d.base.varDeclBits.has_init;
+}
+
+public fn Expr* VarDecl.getInit(const VarDecl* d) {
+    if (d.base.varDeclBits.has_init) {
+        VarDeclInit* init = d.typeRef.getPointerAfter();
+        return init.expr;
+    }
+    return nil;
+}
+
+public fn Expr** VarDecl.getInit2(VarDecl* d) {
+    if (d.base.varDeclBits.has_init) {
+        VarDeclInit* init = d.typeRef.getPointerAfter();
+        return &init.expr;
+    }
+    return nil;
+}
+
+// Note: can ONLY be done for incremental arrays / embed attr (since init is tail allocated)
+public fn void VarDecl.setInit(VarDecl* d, Expr* initValue) {
+    d.base.varDeclBits.has_init = 1;
+    VarDeclInit* init = d.typeRef.getPointerAfter();
+    init.expr = initValue;
+}
+
+fn BitFieldInfo* VarDecl.getBitFieldInfo(const VarDecl* d) {
+    if (d.base.varDeclBits.is_bitfield) return d.typeRef.getPointerAfter();
+    return nil;
+}
+
+public fn Expr* VarDecl.getBitfield(const VarDecl* d) {
+    BitFieldInfo* info = d.getBitFieldInfo();
+    if (info) return info.expr;
+    return nil;
+}
+
+public fn void VarDecl.setBitfieldWidth(VarDecl* d, u8 width) {
+    // Note: does not check anything
+    BitFieldInfo* info = d.getBitFieldInfo();
+    info.layout.bit_width = width;
+}
+
+public fn BitFieldLayout* VarDecl.getBitfieldLayout(const VarDecl* d) {
+    BitFieldInfo* info = d.getBitFieldInfo();
+    if (info) return &info.layout;
+    return nil;
+}
+
+public fn bool VarDecl.isStatic(const VarDecl* d) {
+    return d.base.varDeclBits.is_static;
+}
+
+public fn void VarDecl.setStatic(VarDecl* d, bool is_static) {
+    d.base.varDeclBits.is_static = is_static;
+}
+
+public fn bool VarDecl.isTLocal(const VarDecl* d) {
+    return d.base.varDeclBits.is_tlocal;
+}
+
+public fn void VarDecl.setTLocal(VarDecl* d) {
+    d.base.varDeclBits.is_static = true;
+    d.base.varDeclBits.is_tlocal = true;
+}
+
+public fn void VarDecl.setInitCall(VarDecl* d, bool has_init_call) {
+    d.base.varDeclBits.has_init_call = has_init_call;
+}
+
+public fn bool VarDecl.hasInitCall(const VarDecl* d) {
+    return d.base.varDeclBits.has_init_call;
+}
+
+public fn void VarDecl.setAttrWeak(VarDecl* d) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.attr_weak = 1;
+}
+
+public fn bool VarDecl.hasAttrWeak(const VarDecl* d) {
+    return d.base.varDeclBits.attr_weak;
+}
+
+fn AutoAttr VarDecl.getAutoAttr(const VarDecl* d) {
+    return d.base.varDeclBits.auto_attr;
+}
+
+public fn void VarDecl.setAttrAutoFile(VarDecl* d) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.auto_attr = File;
+}
+
+public fn bool VarDecl.hasAttrAutoFile(const VarDecl* d) {
+    return d.getAutoAttr() == File;
+}
+
+public fn void VarDecl.setAttrAutoLine(VarDecl* d) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.auto_attr = Line;
+}
+
+public fn bool VarDecl.hasAttrAutoLine(const VarDecl* d) {
+    return d.getAutoAttr() == Line;
+}
+
+public fn void VarDecl.setAttrAutoFunc(VarDecl* d) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.auto_attr = Func;
+}
+
+public fn bool VarDecl.hasAttrAutoFunc(const VarDecl* d) {
+    return d.getAutoAttr() == Func;
+}
+
+public fn void VarDecl.setAttrAutoExpr(VarDecl* d) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.auto_attr = Expr;
+}
+
+public fn bool VarDecl.hasAttrAutoExpr(const VarDecl* d) {
+    return d.getAutoAttr() == Expr;
+}
+
+public fn bool VarDecl.hasAutoAttr(const VarDecl* d) {
+    return d.getAutoAttr() != None;
+}
+
+public fn void VarDecl.setFormatAttr(VarDecl* d, FormatAttr kind) {
+    d.base.declBits.has_attr = 1;
+    d.base.varDeclBits.format_attr = kind;
+}
+
+public fn FormatAttr VarDecl.getFormatAttr(const VarDecl* d) {
+    return d.base.varDeclBits.format_attr;
+}
+
+fn void VarDecl.print(const VarDecl* d, StringBuf* out, u32 indent) {
+    bool valid_type = d.base.qt.isValid();
+    d.base.printKind(out, indent, valid_type);
+    if (!valid_type) {
+        out.space();
+        d.typeRef.print(out, true);
+    }
+    out.color(col_Attr);
+    VarDeclKind k = d.getKind();
+    out.space();
+    out.add(k.name);
+    if (d.base.varDeclBits.is_bitfield) {
+        BitFieldLayout* layout = d.getBitfieldLayout();
+        out.print(" bitfield(%d, %d)", layout.bit_offset, layout.bit_width);
+    }
+    if (d.isStatic()) out.add(" (static)");
+    if (d.base.varDeclBits.attr_weak) out.add(" weak");
+    if (d.base.varDeclBits.addr_used) out.add(" addr_used");
+    switch (d.base.varDeclBits.auto_attr) {
+    case None: break;
+    case File: out.add(" auto_file"); break;
+    case Line: out.add(" auto_line"); break;
+    case Func: out.add(" auto_func"); break;
+    case Expr: out.add(" auto_expr"); break;
+    }
+    switch (d.getFormatAttr()) {
+    case None: break;
+    case Printf: out.add(" printf_format"); break;
+    case Scanf: out.add(" scanf_format"); break;
+    }
+    if (d.base.varDeclBits.has_init_call) out.add(" init_call");
+    d.base.printBits(out);
+    d.base.printAttrs(out);
+    out.color(col_Value);
+    d.base.printName(out);
+    out.newline();
+
+    if (d.base.varDeclBits.has_init) {
+        Expr* i = d.getInit();
+        i.print(out, indent + 1);
+    }
+}
+
+fn void VarDecl.printType(const VarDecl* d, StringBuf* out) {
+    if (d.base.qt.isValid()) {
+        d.base.qt.printQuoted(out);
+    } else {
+        d.typeRef.print(out, true);
+    }
+}
+

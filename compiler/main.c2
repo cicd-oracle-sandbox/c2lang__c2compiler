@@ -1,0 +1,792 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2c_main;
+
+import build_file;
+import build_file_parser;
+import build_target { PluginList, BuildTarget, BackEndKind }
+import console;
+import c2recipe { Recipe }
+import compiler;
+import constants { recipe_name }
+import file_buffer { FileBuffer }
+import file_utils { Pathname, path_exists, get_basename, get_extension }
+#if C2_PLUGINS && !BOOTSTRAP
+import git_version; // from plugin
+#endif
+import diagnostics { Diags }
+import plugin_info;
+import plugin_mgr { PluginMgr }
+import source_mgr { SourceMgr, Location }
+import string_list { StringList }
+import string_buffer { StringBuf }
+import string_pool { StringPool }
+import string_splitter { StringSplitter }
+import string_utils;
+import utils;
+
+import c_errno { errno }
+import stdio { snprintf }
+import stdlib { exit, EXIT_FAILURE, EXIT_SUCCESS, getenv }
+import string { memset, memchr, strlen, strerror }
+
+type Options struct {
+    bool log_verbose;
+    bool force_warnings;
+    bool print_timing;
+    bool show_targets;
+    bool show_plugins;
+    bool quiet_mode;
+    bool no_plugins;
+    bool use_ir_backend;
+    bool trace_calls;
+    bool use_math_library;
+    bool use_color;
+    const char* build_file;
+    const char* other_dir;
+    const char* output_name;
+    StringList targets;
+    StringList files;
+    StringList features;
+}
+
+fn void Options.init(Options* opts, StringPool* pool, bool use_color) {
+    memset(opts, 0, sizeof(Options));
+    opts.use_color = use_color;
+    opts.targets.init(pool);
+    opts.files.init(pool);
+    opts.features.init(pool);
+}
+
+fn void Options.free(Options* opts) {
+    opts.targets.free();
+    opts.files.free();
+    opts.features.free();
+}
+
+fn void write_file_or_die(const char* filename, StringBuf* buf) {
+    FileBuffer fbuf.init(buf.data(), buf.size());
+    if (!fbuf.writeFile(filename)) {
+        console.error("c2c: cannot write to %s: %s", filename, fbuf.getError());
+        exit(EXIT_FAILURE);
+    }
+    fbuf.deinit();
+}
+
+const char[] GenMain =
+```
+module %s_main;
+
+public fn i32 main(i32 argc, char** argv) {
+    return 0;
+}
+```;
+
+
+const char[] GenRecipe =
+```
+plugin deps_generator [all-targets files private]
+plugin refs_generator [all-targets]
+
+executable %s
+    $warnings no-unused
+    $backend c
+
+    main.c2
+end
+```;
+
+fn void create_project(const char* name) {
+
+    if (path_exists("main.c2") || path_exists("recipe.txt")) {
+        console.error("c2c: main.c2 and/or recipe.txt already exist");
+        exit(EXIT_FAILURE);
+    }
+
+    StringBuf* buf = StringBuf.create(4096, false, 2);
+
+    buf.print(GenMain, name);
+    write_file_or_die("main.c2", buf);
+
+    buf.clear();
+    buf.print(GenRecipe, name);
+    write_file_or_die("recipe.txt", buf);
+
+    buf.free();
+    console.log("created new project files");
+    exit(EXIT_SUCCESS);
+}
+
+const char[] Recipe_help =
+    ```
+    ---- recipe.txt ----
+
+    plugin <name> [<plugin-options>]
+
+    config <options>
+
+    set <name>
+       <.c2 files>
+    end
+
+    executable <name>
+       $optional
+       $disabled
+       $optional
+       $warnings <no-unused>
+                 <no-unused-variable>
+                 <no-unused-function>
+                 <no-unused-parameter>
+                 <no-unused-type>
+                 <no-unused-module>
+                 <no-unused-import>
+                 <no-unused-public>
+                 <no-unused-label>
+                 <no-unused-enum-constant>
+                 <no-unused-enum-assoc-value>
+                 <no-unreachable-code>
+                 <unknown-attribute>
+                 <deprecated>
+       $backend [c|ir] <check>
+                       <fast>
+                       <no-build>
+       $nolibc
+       $disable-asserts
+       $config <options>
+       $plugin <name> [<plugin-options>]
+       $use <library-name> dynamic/static/source
+       (set-name)
+       <file1.c2>
+       <file2.c2>
+    end
+
+    lib <name> dynamic/static
+       $export <module-names>
+       other options same as executable
+    end
+
+    --------------------
+```;
+
+fn void print_recipe_help() {
+    console.log(Recipe_help);
+}
+
+fn void print_version() {
+#if C2_PLUGINS && !BOOTSTRAP
+    console.log("version: %s", git_version.Describe);
+#else
+    console.log("version: unknown");
+#endif
+}
+
+const char[] Usage_help =
+```
+Usage: c2c <options> [<targets>]
+       c2c <options> <filenames>
+Options:
+  -a                print ASTs
+  -A                print Library ASTs
+  -b [file]         use specified build file
+  -d [dir]          change to [dir] first
+  -Dfeature[=value] define global feature with optional value
+  -h                print this help
+  -i                use IR backend
+  -I                use IR backend and print generated IR
+  -lm               link the math module
+  -m                print modules
+  -o [file]         force the output name for a single target
+  -r                print reports
+  -s                print symbols
+  -S                print library symbols
+  -t                print timings
+  -T                print AST statistics
+  -v                verbose logging
+  -w                enable all warnings (overrides recipe)
+  --all             dont skip optional targets
+  --asan            generate code with address sanity checks
+  --msan            generate code with memory sanity checks
+  --ubsan           generate code with undefined behavior sanity checks
+  --bootstrap       define BOOTSTRAP feature and disable selected options
+  --check           only parse and check
+  --create [name]   create an empty project recipe.txt and main.c2
+  --fast            do fast, un-optimized build
+  --no-build        generate backend files but do not make the targets
+  --color           force colorized output
+  --no-color        disable colorized output
+  --help            print this help
+  --help-recipe     print the recipe syntax
+  --I2              use IR backend and print generated IR (all versions)
+  --noplugins       do not use plugins
+  --showlibs        print available libraries
+  --showplugins     print available plugins
+  --target [triple] cross compile for a specified architecture
+  --targets         show available targets in recipe
+  -q  --quiet       prevent compiler logging messages
+  --test            test mode (do not check for main() function)
+  --trace-calls     generate code that traces function calls
+  --version         print version;
+```;
+
+type ArgumentParser struct {
+    i32 cur;
+    i32 argc;
+    char** argv;
+    const char* prog;
+    const char* help;
+}
+
+fn void ArgumentParser.init(ArgumentParser* ap, i32 argc, char** argv,
+                            const char* prog = nil, const char* help = nil)
+{
+    ap.cur = 1;
+    ap.argc = argc;
+    ap.argv = argv;
+    ap.prog = prog ? prog : argv[0];
+    ap.help = help;
+}
+
+fn void ArgumentParser.showHelp(ArgumentParser* ap) {
+    if (ap.help) console.log("%s", ap.help);
+}
+
+fn const char* ArgumentParser.getArgument(ArgumentParser* ap) {
+    return ap.cur < ap.argc ? ap.argv[ap.cur++] : nil;
+}
+
+fn const char* ArgumentParser.getOptionArgument(ArgumentParser* ap, const char* option) {
+    if (ap.cur < ap.argc) return ap.argv[ap.cur++];
+    ap.missingArgument(option);
+}
+
+fn void ArgumentParser.missingArgument(ArgumentParser* ap, const char* option) @(noreturn) {
+    console.error("%s: missing argument for option '%s'", ap.prog, option);
+    exit(EXIT_FAILURE);
+}
+
+fn void ArgumentParser.unknownOption(ArgumentParser* ap, const char* option) @(noreturn) {
+    console.error("%s: unknown option: '%s'", ap.prog, option);
+    exit(EXIT_FAILURE);
+}
+
+fn void parse_long_opt(ArgumentParser* ap, const char* arg, compiler.Options* comp_opts, Options* opts) {
+    switch (arg+2) {
+    case "I2":
+        opts.use_ir_backend = true;
+        comp_opts.print_all_ir = true;
+        break;
+    case "all":
+        comp_opts.all = true;
+        break;
+    case "bootstrap":
+        comp_opts.bootstrap = true;
+        break;
+    case "check":
+        comp_opts.check_only = true;
+        break;
+    case "create":
+        create_project(ap.getOptionArgument(arg));
+        break;
+    case "fast":
+        comp_opts.fast_build = true;
+        break;
+    case "no-build":
+        comp_opts.no_build = true;
+        break;
+    case "color":
+        comp_opts.use_color = true;
+        opts.use_color = true;
+        break;
+    case "no-color":
+        comp_opts.use_color = false;
+        opts.use_color = false;
+        break;
+    case "help":
+        ap.showHelp();
+        exit(EXIT_SUCCESS);
+    case "help-recipe":
+        print_recipe_help();
+        exit(EXIT_SUCCESS);
+    case "noplugins":
+        opts.no_plugins = true;
+        break;
+    case "quiet":
+        opts.quiet_mode = true;
+        break;
+    case "showlibs":
+        comp_opts.show_libs = true;
+        break;
+    case "showplugins":
+        opts.show_plugins = true;
+        break;
+    case "target":
+        comp_opts.target_triple = ap.getOptionArgument(arg);
+        break;
+    case "targets":
+        opts.show_targets = true;
+        break;
+    case "test":
+        comp_opts.test_mode = true;
+        break;
+    case "trace-calls":
+        opts.trace_calls = true;
+        break;
+    case "asan":
+        comp_opts.asan = true;
+        break;
+    case "msan":
+        comp_opts.msan = true;
+        break;
+    case "ubsan":
+        comp_opts.ubsan = true;
+        break;
+    case "version":
+        print_version();
+        exit(EXIT_SUCCESS);
+    default:
+        ap.unknownOption(arg);
+    }
+}
+
+fn void parse_arguments(ArgumentParser* ap, compiler.Options* comp_opts, Options* opts) {
+    while (const char* arg = ap.getArgument()) {
+        if (arg[0] == '-') {
+            if (arg[1] == '-') {
+                parse_long_opt(ap, arg, comp_opts, opts);
+            } else {
+                const char* argarg = nil;
+                if (memchr("Ddbo", arg[1], 4)) { // need argument
+                    argarg = arg[2] ? &arg[2] : ap.getOptionArgument(arg);
+                } else
+                if (strlen(arg) != 2) {
+                    switch (arg + 1) {
+                    case "help":
+                        ap.showHelp();
+                        exit(EXIT_SUCCESS);
+                    case "lm":
+                        opts.use_math_library = true;
+                        continue;
+                    }
+                    ap.unknownOption(arg);
+                }
+                switch (arg[1]) {
+                case '0':    // 'hidden' feature, print AST early after parsing, then quit
+                    comp_opts.print_ast_early = true;
+                    break;
+                case 'A':
+                    comp_opts.print_lib_ast = true;
+                    break;
+                case 'D':
+                    opts.features.addStr(argarg);
+                    break;
+                case 'I':
+                    opts.use_ir_backend = true;
+                    comp_opts.print_ir = true;
+                    break;
+                case 'S':
+                    comp_opts.print_external_symbols = true;
+                    break;
+                case 'T':
+                    comp_opts.print_ast_stats = true;
+                    break;
+                case 'a':
+                    comp_opts.print_ast = true;
+                    break;
+                case 'b':
+                    opts.build_file = argarg;
+                    break;
+                case 'd':
+                    opts.other_dir = argarg;
+                    break;
+                case '?':
+                case 'h':
+                    ap.showHelp();
+                    exit(EXIT_SUCCESS);
+                case 'i':
+                    opts.use_ir_backend = true;
+                    break;
+                case 'm':
+                    comp_opts.print_modules = true;
+                    break;
+                case 'o':
+                    opts.output_name = argarg;
+                    break;
+                case 'q':
+                    opts.quiet_mode = true;
+                    break;
+                case 'r':
+                    comp_opts.print_reports += 1;
+                    break;
+                case 's':
+                    comp_opts.print_symbols = true;
+                    break;
+                case 't':
+                    opts.print_timing = true;
+                    break;
+                case 'v':
+                    opts.log_verbose = true;
+                    break;
+                case 'w':
+                    opts.force_warnings = true;
+                    break;
+                default:
+                    ap.unknownOption(arg);
+                }
+            }
+        } else {
+            if (string_utils.endsWith(arg, ".c2"))
+                opts.files.addStr(arg);
+            else
+                opts.targets.addStr(arg);
+        }
+    }
+
+    u32 num_targets = opts.targets.length();
+    u32 num_files = opts.files.length();
+    if (num_targets && num_files) {
+        console.error("c2c: recipe targets cannot be combined with <files>");
+        exit(EXIT_FAILURE);
+    }
+    if (opts.output_name && num_files == 0 && num_targets != 1) {
+        console.error("c2c: option -o can only be used for a single target");
+        exit(EXIT_FAILURE);
+    }
+}
+
+fn void plugins_start_target(void* arg, plugin_info.Info* info) {
+    PluginMgr* plugins = arg;
+    plugins.beginTarget(info);
+}
+
+fn void plugins_after_parsing(void* arg) {
+    PluginMgr* plugins = arg;
+    plugins.postParse();
+}
+
+fn void plugins_after_analysis(void* arg) {
+    PluginMgr* plugins = arg;
+    plugins.postAnalysis();
+}
+
+fn void plugins_end_target(void* arg) {
+    PluginMgr* plugins = arg;
+    plugins.endTarget();
+}
+
+type Context struct {
+    utils.PathInfo path_info;
+
+    // note: auxPool is used by recipe, build-file and manifests
+    StringPool* auxPool;
+    SourceMgr* sm;
+    Diags* diags;
+
+    Options opts;
+    compiler.Options comp_opts;
+
+    Recipe* recipe;
+    build_file.Info* build_info;
+    Pathname build_filename;
+    i32 recipe_id;
+
+    PluginMgr* plugins;
+    const PluginList* pl;
+    compiler.PluginHandler pluginHandler;
+    u32 plugins_feature;
+}
+
+fn void Context.init(Context* c, bool use_color) {
+    memset(c, 0, sizeof(Context));
+    // note: auxPool is used by recipe, build-file and manifests
+    c.auxPool = StringPool.create(32*1024, 256);
+    c.sm = SourceMgr.create(c.auxPool, use_color);
+    c.diags = Diags.create(c.sm, use_color, &c.path_info);
+    c.recipe = Recipe.create(c.sm, c.auxPool, use_color);
+
+    c.opts.init(c.auxPool, use_color);
+    c.comp_opts.use_color = use_color;
+    c.recipe_id = -1;
+}
+
+fn void Context.handle_args(Context* c, i32 argc, char** argv) {
+    ArgumentParser ap.init(argc, argv, "c2c", Usage_help);
+    parse_arguments(&ap, &c.comp_opts, &c.opts);
+
+    console.setTiming(c.opts.print_timing);
+    console.setDebug(c.opts.log_verbose);
+    console.setQuiet(c.opts.quiet_mode);
+    console.setColor(c.opts.use_color);
+
+    const char[] notFound = "c2c: error: cannot find project root directory\n"
+                            "     c2c requires a %s file in the project root,\n"
+                            "     Use argument -h for c2c usage and a list of available options";
+    if (c.opts.other_dir) {
+        if (c.opts.files.length()) {
+            console.error("c2c: The -d option cannot be combined with <files>");
+            exit(EXIT_FAILURE);
+        }
+        u32 err = utils.changeToProjectDir(&c.path_info, c.opts.other_dir);
+        switch (err) {
+        case 0:
+            break;
+        case 2:
+            console.error("c2c: cannot chdir to %s: %s", c.opts.other_dir, strerror(errno));
+            exit(EXIT_FAILURE);
+            break;
+        case 3:
+            console.error(notFound, recipe_name);
+            exit(EXIT_FAILURE);
+            break;
+        }
+    }
+
+    if (c.opts.files.length()) {
+        // use basename of first filename as target name
+        const char* basename = get_basename(c.opts.files.get(0));
+        const char* ext = get_extension(basename);
+        u32 target_idx = c.auxPool.add(basename, (u32)(ext - basename), true);
+        BackEndKind backend = C;
+        if (c.opts.use_ir_backend) backend = IR;
+        BuildTarget* t = c.recipe.addTarget(target_idx, 0, Executable);
+        t.setBackEnd(backend);
+        if (c.opts.use_math_library)
+            t.addLib(c.auxPool.addStr("math", true), DynamicLibrary);
+
+        for (u32 i = 0; i < c.opts.files.length(); i++)
+            t.addFile(c.opts.files.get_idx(i), 0);
+        t.disableWarnings();
+    } else {
+        if (c.opts.use_ir_backend) {
+            console.error("c2c: the IR backend is currently experimental and only works on individual files, not recipes");
+            exit(EXIT_FAILURE);
+        }
+
+        if (!c.opts.other_dir && !utils.findProjectDir(&c.path_info)) {
+            console.error(notFound, recipe_name);
+            exit(EXIT_FAILURE);
+        }
+        c.recipe_id = c.sm.loadFile(recipe_name, 0);
+        if (c.recipe_id == -1) exit(EXIT_FAILURE);
+        if (!c.recipe.parse(c.recipe_id)) exit(EXIT_FAILURE);
+        // keep c.recipe_id open so we can close source files in source_mgr
+    }
+
+    // look for build file (or use specified one)
+    bool auto_found_buildfile = false;
+    if (!c.opts.build_file) {
+        c.opts.build_file = utils.findBuildFile();
+        auto_found_buildfile = true;
+    }
+
+    c.plugins = PluginMgr.create(c.auxPool, console.getConfig(), c.opts.no_plugins);
+
+    bool have_plugin_dir = false;
+    if (c.opts.build_file) {
+        if (auto_found_buildfile) {
+            c.build_filename.init(c.opts.build_file);
+        } else {
+            c.build_filename.init(c.path_info.orig2root, c.opts.build_file);
+        }
+        console.log("using build-file %s", c.build_filename.path);
+        c.build_info = build_file_parser.parse(c.sm, c.auxPool, c.build_filename.path);
+        if (!c.build_info) exit(EXIT_FAILURE);
+
+        const StringList* plugin_dirs = c.build_info.getPluginDirs();
+        for (u32 i=0; i<plugin_dirs.length(); i++) {
+            have_plugin_dir = true;
+            c.plugins.addPath(plugin_dirs.get_idx(i));
+        }
+
+        if (!c.opts.show_plugins) {
+            // load global plugins from build-file
+            for (u32 i=0; i<c.build_info.getNumPlugins(); i++) {
+                const build_file.Plugin* p = c.build_info.getPlugin(i);
+                if (!c.plugins.loadGlobal(p.name, p.options)) {
+                    Location loc = c.sm.locate(p.loc);
+                    char[256] loc_str;
+                    snprintf(loc_str, countof(loc_str), "%s:%d:%d", loc.filename, loc.line, loc.column);
+                    console.error_diag(loc_str, "%s", c.plugins.getError());
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+    }
+
+    if (!have_plugin_dir) {
+        const char* plugin_dir = getenv("C2_PLUGINDIR");
+        if (plugin_dir) {
+            StringSplitter split.init(plugin_dir, ':');
+            while (split.next()) {
+                u32 path_idx = c.auxPool.add(split.cur, split.len, true);
+                c.plugins.addPath(path_idx);
+            }
+        } else {
+            console.warn("environment variable C2_PLUGINDIR not set!");
+        }
+    }
+
+    c.comp_opts.libdir = getenv("C2_LIBDIR");
+    if (!c.comp_opts.libdir && !c.opts.build_file) {
+        console.warn("environment variable C2_LIBDIR not set!");
+    }
+}
+
+fn void Context.handle_plugins(Context* c) {
+    if (c.opts.show_plugins) {
+        c.plugins.show();
+        exit(EXIT_SUCCESS);
+    }
+
+    // load global plugins from recipe
+    c.pl = c.recipe.getPlugins();
+    for (u32 i=0; i<c.pl.size(); i++) {
+        const build_target.Plugin* p = c.pl.get(i);
+        if (!c.plugins.loadGlobal(p.name, p.options)) {
+            Location loc = c.sm.locate(p.loc);
+            char[256] loc_str;
+            snprintf(loc_str, countof(loc_str), "%s:%d:%d", loc.filename, loc.line, loc.column);
+            console.error_diag(loc_str, "%s", c.plugins.getError());
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    c.plugins_feature = c.auxPool.addStr("C2_PLUGINS", false);
+
+    compiler.PluginHandler pluginHandler = {
+        .start_target = plugins_start_target,
+        .after_parsing = plugins_after_parsing,
+        .after_analysis = plugins_after_analysis,
+        .end_target = plugins_end_target,
+        .arg = c.plugins,
+    }
+    c.pluginHandler = pluginHandler;
+}
+
+fn bool Context.build_target(Context* c,
+                             BuildTarget* target,
+                             const char* target_name)
+{
+    u32 num_errors = c.diags.getNumErrors();
+    if (c.opts.force_warnings) target.enableWarnings();
+
+    if (c.opts.output_name) {
+        console.log("building %s as %s", target_name, c.opts.output_name);
+        target_name = c.opts.output_name;
+        target.setNameIdx(c.auxPool.addStr(target_name, true));
+    } else {
+        console.log("building %s", target_name);
+    }
+
+    c.comp_opts.trace_calls = c.opts.trace_calls;
+    if (c.opts.trace_calls && target.getNoLibC()) {
+        c.comp_opts.trace_calls = false;
+        console.warn("c2c: disabling --trace-calls for nolibc target %s", target_name);
+    }
+
+    // load target-specific plugins from recipe
+    c.pl = target.getPlugins();
+    for (u32 j=0; j<c.pl.size(); j++) {
+        const build_target.Plugin* p = c.pl.get(j);
+        if (!c.plugins.loadLocal(p.name, p.options)) {
+            Location loc = c.sm.locate(p.loc);
+            char[256] loc_str;
+            snprintf(loc_str, countof(loc_str), "%s:%d:%d", loc.filename, loc.line, loc.column);
+            console.error_diag(loc_str, "%s", c.plugins.getError());
+            continue;
+        }
+    }
+
+    if (!c.opts.no_plugins) target.addFeature(c.plugins_feature);
+    if (c.opts.use_ir_backend) target.setBackEnd(IR);
+
+    if (!target.hasBackEnd() && target.getKind() != SourceLibrary) {
+        if (!c.comp_opts.test_mode && !c.comp_opts.check_only) {
+            console.error("c2c: no backend for target %s defined in %s", target_name, recipe_name);
+            if (c.recipe_id != -1) c.sm.clear(c.recipe_id);
+            return false;
+        }
+    }
+
+    compiler.build(c.auxPool, c.sm, c.diags, c.build_info, target, &c.comp_opts, &c.opts.features, &c.pluginHandler);
+
+    // TODO unload target-specific plugins?
+    // TODO fix build_file
+    if (c.recipe_id != -1) c.sm.clear(c.recipe_id);
+    return c.diags.getNumErrors() > num_errors;
+}
+
+fn bool Context.build_targets(Context* c) {
+    bool has_filter = (c.opts.targets.length() != 0);
+    bool hasError = false;
+
+    for (u32 i=0; i<c.recipe.numTargets(); i++) {
+        BuildTarget* target = c.recipe.getTarget(i);
+
+        u32 target_idx = target.getNameIdx();
+        const char* target_name = c.auxPool.idx2str(target_idx);
+
+        if (has_filter) {
+            if (!c.opts.targets.contains_idx(target_idx)) continue;
+            c.opts.targets.del(target_idx);
+            if (target.getDisabled()) {
+                console.warn("target '%s' is disabled", target_name);
+                continue;
+            }
+        } else {
+            if (target.getDisabled()) continue;
+            if (target.getOptional() && !c.comp_opts.all) continue;
+        }
+        if (c.opts.show_targets) {
+            console.log("%s", target_name);
+            continue;
+        }
+        hasError |= c.build_target(target, target_name);
+    }
+
+    if (has_filter && c.opts.targets.length()) {
+        for (u32 i = 0; i < c.opts.targets.length(); i++) {
+            const char* name = c.opts.targets.get(i);
+            console.warn("no such target in %s: %s", recipe_name, name);
+        }
+    }
+
+    return hasError;
+}
+
+fn void Context.free(Context* c) {
+    c.plugins.free();
+    if (c.build_info) c.build_info.free();
+    c.recipe.free();
+    c.opts.free();
+    c.diags.free();
+    c.sm.free();
+    c.auxPool.free();
+}
+
+public fn i32 main(i32 argc, char** argv) {
+    console.init();
+
+    Context c.init(console.getColor());
+    c.handle_args(argc, argv);
+    c.handle_plugins();
+
+    bool hasError = c.build_targets();
+
+    c.free();
+
+    return hasError ? -1 : 0;
+}
+

@@ -1,0 +1,76 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ir_rpo;
+
+import ir { * }
+
+import stdlib { malloc, free }
+
+public type Rpo struct {
+    u16* blocks;
+}
+
+public fn void Rpo.create(Rpo* rpo, const FunctionInfo* fi) {
+    u32 num_blocks = fi.blocks.getCount();
+    Block* blocks = fi.blocks.get(0);
+    //printf("RPO %d blocks\n", num_blocks);
+
+    for (u32 i=0; i<num_blocks; i++) blocks[i].checked = false;
+
+    assert(num_blocks > 0 && num_blocks <= u16.max);
+    rpo.blocks = malloc(num_blocks * sizeof(u16));
+    //rpo.num_blocks = num_blocks;
+
+    u32 todo = num_blocks-1;  // insert point
+    u32 idx = todo; // check point
+    //printf("  rpo[%d] -> %d\n", todo, 0);
+    rpo.blocks[todo--] = 0;
+    while (idx > todo) { // stop when all inserted blocks are processed
+        u16 blk_id = rpo.blocks[idx];
+        //printf("  %d/%d  rpo[%d]  B%d\n", todo, num_blocks, idx, blk_id);
+        assert(blk_id < num_blocks);
+        Block* b = &blocks[blk_id];
+        for (u32 d = 0; d < 2; d++) {
+            u32 dest_id = b.dests[d];
+            if (!dest_id) break;
+
+            Block* dest = &blocks[dest_id];
+            if (!dest.checked) {
+                //printf("  rpo[%d] -> %d\n", todo, dest_id);
+                rpo.blocks[todo--] = (u16)dest_id;
+                dest.checked = true;
+            }
+        }
+        idx--;
+    }
+
+    // unreachable blocks are not visited above, put them first so the array stays complete
+    for (u32 i = 1; i < num_blocks; i++) {
+        if (!blocks[i].checked) rpo.blocks[todo--] = (u16)i;
+    }
+    assert(todo == u32.max);
+
+#if 0
+    printf("RPO: ");
+    for (u32 i = 0; i < num_blocks; i++) printf(" %d", rpo.blocks[i]);
+    printf("\n");
+#endif
+}
+
+public fn void Rpo.free(Rpo* rpo) {
+    free(rpo.blocks);
+}
+

@@ -1,0 +1,44 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module event_test;
+
+import stdio { fprintf, fwrite, stderr, stdout }
+
+import file_buffer { FileBuffer }
+
+public fn i32 main(i32 argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: file_ops [file]\n");
+        return 2;
+    }
+
+    const char* filename = argv[1];
+    FileBuffer file.init();
+    if (!file.loadFile(filename)) {
+        fprintf(stderr, "cannot load '%s': %s\n", filename, file.getError());
+        file.deinit();
+        return 1;
+    }
+
+    const char* contents = file.data();
+    usize size = file.size();
+    fwrite(contents, 1, size, stdout);
+
+    file.deinit();
+
+    return 0;
+}
+

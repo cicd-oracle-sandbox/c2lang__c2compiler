@@ -1,0 +1,134 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c_generator;
+
+import ast { * }
+import string_buffer { StringBuf }
+
+fn void Generator.emitCall(Generator* gen, StringBuf* out, Expr* e) {
+    CallExpr* call = (CallExpr*)e;
+
+    Decl* dest = nil;
+    Expr* func = call.getFunc();
+    if (call.isTemplateCall()) {
+        QualType qt = func.getType();
+        FunctionType* ft = qt.getFunctionTypeOrNil();
+        FunctionDecl* template_fd = ft.getDecl();
+        u32 idx = call.getTemplateIdx();
+        FunctionDecl* instance = gen.mod.getInstance(template_fd, idx);
+        assert(instance);
+
+        assert(!call.isTypeFunc()); // TODO
+
+        dest = instance.asDecl();
+        if (!dest.isGenerated()) {
+            gen.emitFunction(instance);
+            instance.asDecl().setGenerated();
+        }
+        gen.emitDeclName(out, dest);
+        out.lparen();
+    } else {
+        if (func.isImplicitCast()) {
+            ImplicitCastExpr* ic = (ImplicitCastExpr*)func;
+            func = ic.getInner();
+        }
+
+        if (call.isTypeFunc()) {
+            assert(func.isMember());
+            MemberExpr* m = (MemberExpr*)func;
+            dest = m.getFullDecl();
+            if (gen.trace_calls && !gen.no_trace) {
+                out.print("(c2_trace_counts[%d]++, ",
+                          gen.addCall(dest.getFullName(), call.getStartLoc()));
+                gen.emitCNameMod(out, dest, dest.getModule());
+                out.add1(')');
+            } else {
+                gen.emitCNameMod(out, dest, dest.getModule());
+            }
+            out.lparen();
+
+            // emit self arg
+            // Do auto-conversions if needed (Foo -> Foo*, Foo* -> Foo)
+            switch (m.getConversion()) {
+            case None:
+                break;
+            case Addr:
+                out.add1('&');
+                break;
+            case Deref:
+                out.add1('*');
+                break;
+            }
+
+            MemberContext mc = {}
+            gen.emitMemberExpr(out, m, &mc, true);
+        } else {
+            bool no_trace = true;
+            if (gen.trace_calls) {
+                no_trace = gen.no_trace;
+                dest = getFuncDecl(func, &no_trace);
+            }
+            if (!no_trace) {
+                const char* dest_name = dest ? dest.getFullName() : "*";
+                out.print("(c2_trace_counts[%d]++, ",
+                          gen.addCall(dest_name, call.getStartLoc()));
+                gen.emitExpr(out, func);
+                out.add1(')');
+            } else {
+                gen.emitExpr2(out, func, Postfix);
+            }
+            out.lparen();
+        }
+    }
+
+    u32 call_num_args = call.getNumArgs();
+    Expr** args = call.getArgs();
+
+    bool need_comma = call.isTypeFunc();
+    for (u32 i = 0; i < call_num_args; i++) {
+        if (need_comma) out.add(", ");
+        Expr* arg = args[i];
+        if (arg.isInitList()) gen.emitCast(out, arg.getType(), true);
+
+        gen.emitExpr(out, arg);
+        need_comma = true;
+    }
+    out.rparen();
+}
+
+fn Decl* getFuncDecl(Expr* func, bool* no_trace) {
+    switch (func.getKind()) {
+    case Identifier:
+        // TODO check for pointer
+        IdentifierExpr* i = (IdentifierExpr*)func;
+        // do not trace calls to va_start, va_arg, va_end...
+        const char* name = i.getName();
+        if (name && name[0] == 'v' && name[1] == 'a' && name[2] == '_')
+            *no_trace = true;
+        return i.getDecl();
+    case Member:
+        // TODO check for struct member
+        MemberExpr* m = (MemberExpr*)func;
+        return m.getFullDecl();
+    case Alternate:
+        AlternateExpr* a = (AlternateExpr*)func;
+        Expr* g = a.getGenerated();
+        return getFuncDecl(a.getGenerated(), no_trace);
+    default:
+        return nil;
+    }
+}
+

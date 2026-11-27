@@ -1,0 +1,115 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+type LabelStmtBits struct {
+    u32 : NumStmtBits;
+    u32 is_used : 1;
+    u32 has_goto : 1;
+    u32 has_break : 1;
+    u32 has_continue : 1;
+}
+static_assert(4, sizeof(LabelStmtBits));
+
+public type LabelStmt struct @(opaque) {
+    Stmt base;
+    u32 name;
+    // 4 bytes padding
+    Stmt* stmt;
+}
+
+public fn LabelStmt* LabelStmt.create(Context* c, u32 name, SrcLoc loc, Stmt* stmt) {
+    LabelStmt* s = c.alloc(sizeof(LabelStmt));
+    s.base.init(Label, loc);
+    s.name = name;
+    s.stmt = stmt;
+#if AstStatistics
+    Stats.addStmt(Label, sizeof(LabelStmt));
+#endif
+    return s;
+}
+
+fn Stmt* LabelStmt.instantiate(LabelStmt* s, Instantiator* inst) {
+    if (!s.stmt) return (Stmt*)s;
+
+    return (Stmt*)LabelStmt.create(inst.c, s.name, s.base.loc, s.stmt.instantiate(inst));
+}
+
+public fn void LabelStmt.setUsed(LabelStmt* s) {
+    s.base.labelStmtBits.is_used = true;
+}
+
+public fn bool LabelStmt.isUsed(const LabelStmt* s) {
+    return s.base.labelStmtBits.is_used;
+}
+
+public fn bool LabelStmt.hasGoto(const LabelStmt* s) {
+    return s.base.labelStmtBits.has_goto;
+}
+
+public fn void LabelStmt.setGoto(LabelStmt* s) {
+    s.base.labelStmtBits.has_goto = true;
+}
+
+public fn bool LabelStmt.hasBreak(const LabelStmt* s) {
+    return s.base.labelStmtBits.has_break;
+}
+
+public fn void LabelStmt.setBreak(LabelStmt* s) {
+    s.base.labelStmtBits.has_break = true;
+}
+
+public fn bool LabelStmt.hasContinue(const LabelStmt* s) {
+    return s.base.labelStmtBits.has_continue;
+}
+
+public fn void LabelStmt.setContinue(LabelStmt* s) {
+    s.base.labelStmtBits.has_continue = true;
+}
+
+public fn u32 LabelStmt.getNameIdx(const LabelStmt* s) {
+    return s.name;
+}
+
+public fn Stmt* LabelStmt.getStmt(const LabelStmt* s) {
+    return s.stmt;
+}
+
+public fn Stmt** LabelStmt.getStmt2(LabelStmt* s) {
+    if (!s.stmt) return nil;
+    return &s.stmt;
+}
+
+fn void LabelStmt.print(const LabelStmt* s, StringBuf* out, u32 indent) {
+    s.base.printKind(out, indent);
+    out.color(col_Value);
+    out.space();
+    out.add(idx2name(s.name));
+    out.color(col_Attr);
+    if (!s.isUsed()) out.add(" unused");
+    if (s.hasGoto()) out.add(" has_goto");
+    if (s.hasBreak()) out.add(" has_break");
+    if (s.hasContinue()) out.add(" has_continue");
+
+    out.newline();
+    if (s.stmt)
+        s.stmt.print(out, indent+1);
+}
+

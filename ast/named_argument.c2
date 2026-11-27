@@ -1,0 +1,72 @@
+/* Copyright 2025-2026 Charlie Gordon
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type NamedArgument struct @(opaque) {
+    Expr base;
+    SrcLoc loc;
+    u32 name;
+    Expr* inner;
+}
+
+public fn NamedArgument* NamedArgument.create(Context* c, SrcLoc loc, u32 name, Expr* inner) {
+    NamedArgument* e = c.alloc(sizeof(NamedArgument));
+    e.base.init(NamedArgument, loc, 0, 0, false, RValue);
+    e.name = name;
+    e.inner = inner;
+#if AstStatistics
+    Stats.addExpr(NamedArgument, sizeof(NamedArgument));
+#endif
+    return e;
+}
+
+fn Expr* NamedArgument.instantiate(NamedArgument* e, Instantiator* inst) {
+    return (Expr*)NamedArgument.create(inst.c, e.base.base.loc, e.name, e.inner.instantiate(inst));
+}
+
+public fn u32 NamedArgument.getNameIdx(const NamedArgument* e) { return e.name; }
+
+public fn Expr* NamedArgument.getInner(const NamedArgument* e) { return e.inner; }
+public fn Expr** NamedArgument.getInner2(NamedArgument* e) { return &e.inner; }
+
+fn SrcLoc NamedArgument.getStartLoc(const NamedArgument* e) {
+    return e.inner.getStartLoc();
+}
+
+fn SrcLoc NamedArgument.getEndLoc(const NamedArgument* e) {
+    return e.inner.getEndLoc();
+}
+
+fn void NamedArgument.print(const NamedArgument* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.space();
+    out.color(col_Value);
+    out.add(idx2name(e.name));
+    out.newline();
+    e.inner.print(out, indent + 1);
+}
+
+fn void NamedArgument.printLiteral(const NamedArgument* e, StringBuf* out) {
+    out.add(idx2name(e.name));
+    out.add(": ");
+    e.inner.printLiteral(out);
+}
+

@@ -1,0 +1,10 @@
+// @warnings{no-unused}
+module test;
+
+type Enum enum u8 { Foo, Bar }
+
+i32[] array = {
+    [test] = 3, // @error{lvalue/rvalue required}
+    [Enum] = 3, // @error{lvalue/rvalue required}
+}
+

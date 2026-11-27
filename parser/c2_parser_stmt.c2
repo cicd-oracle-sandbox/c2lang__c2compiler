@@ -1,0 +1,661 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2_parser;
+
+import ast { * }
+import constants { MaxMultiDecl }
+import src_loc { SrcLoc }
+import stmt_list { StmtList }
+import string_list { StringList }
+import token { Token, Kind }
+
+import ctype { islower }
+
+fn Stmt* Parser.parseStmt(Parser* p) {
+    // TODO use Jump Table (combined one for multiple purposes?)
+    // TODO also jump to Expr part, since most entries use parseExprStmt (dont lookup again in Expr)
+    switch (p.tok.kind) {
+    case Identifier:
+        return p.parseDeclOrStmt();
+    case LBrace:
+        return (Stmt*)p.parseCompoundStmt();
+    case RBrace:
+        p.error("expected statement");
+        break;
+    case KW_asm:
+        return p.parseAsmStmt();
+    case KW_assert:
+        return p.parseAssertStmt();
+    case KW_static_assert:
+        return p.parseStaticAssert(false);
+    case KW_break:
+        return p.parseBreakStmt();
+    case KW_continue:
+        return p.parseContinueStmt();
+    case KW_fallthrough:
+        return p.parseFallthroughStmt();
+    case KW_for:
+        return p.parseForStmt();
+    case KW_goto:
+        return p.parseGotoStmt();
+    case KW_if:
+        return p.parseIfStmt();
+    case KW_return:
+        return p.parseReturnStmt();
+    case KW_switch:
+        return p.parseSwitchStmt();
+    case KW_bool ... KW_f64:        // C2 builtin types
+    case KW_int ... KW_unsigned:    // C type keywords
+    case KW_const:
+    case KW_static:
+    case KW_tlocal:
+    case KW_volatile:
+    case KW_void:
+        // checkSemi, allowLocal, !isCondition
+        return p.parseDeclStmt(true, true, false);
+    case KW_while:
+        return p.parseWhileStmt();
+    default:
+        return p.parseExprStmt();
+    }
+    return nil;
+}
+
+/*
+    Declarations (type + name)
+        a* b <init> -> yes
+        a[] b <init> -> yes
+        a[10] b -> yes
+        a*[] b <init> -> yes
+        a b <init> -> yes
+        a.b c -> yes
+    Assignments/Function calls
+        a = ..     -> no
+        a *= .. etc -> no
+        a() -> no
+        a[10] = .. -> no
+        a.b.c .. -> no
+        a.b->.. -> no
+        a * b != .. -> no
+*/
+fn bool Parser.isTypeSpec(Parser* p) {
+    assert(p.tok.kind == Identifier);
+    Kind kind;
+
+    // State: 0 = ID1, 1 = ID2, 2 = pointers, 3 = arrays, 4 = hasname
+    u32 state = 0;
+    u32 ahead = 1;
+    // TODO check max lookahead otherwise Tokenizer can assert
+    while (1) {
+        switch (p.peekToken(ahead++)) {
+        case Identifier:
+            if (state == 4) return false;
+            state = 4;
+            break;
+        case LSquare:
+            if (state == 4) return false;
+            ahead = p.skipArray(ahead, RSquare);
+            if (!ahead) return false;
+            state = 3;
+            break;
+        case Star:
+            if (state >= 3) return false; // a[1] *, a * b * ..
+            state = 2;
+            break;
+        case Dot:
+            if (state == 4) {
+                return true; // init call
+            }
+            if (state == 0) {
+                kind = p.peekToken(ahead++);
+                if (kind != Identifier) {
+                    // syntax error
+                    return false;
+                }
+                // TODO: second identifier should have capital
+                state = 2;
+            } else {
+                return false; // a.b.c
+            }
+            break;
+        case Equal:
+        case Semicolon:
+        case Comma:
+        //case RParen:
+            return state == 4;
+        case KW_const:
+        case KW_volatile:
+            return true;
+        default:
+            return false;
+        }
+    }
+}
+
+fn u32 Parser.skipArray(Parser* p, u32 ahead, Kind endKind) {
+    u32 depth = 1;
+    Kind[8] closeKind = { endKind }
+    while (depth > 0) {
+        Token next;
+        if (depth >= countof(closeKind)) {
+            p.error("expression too complex");
+        }
+        switch (p.peekToken2(ahead++, &next)) {
+        case LParen:
+            closeKind[depth++] = RParen;
+            break;
+        case RParen:
+            if (closeKind[--depth] != RParen) {
+                p.errorAt(next.loc, "expected ']'");
+            }
+            break;
+        case LSquare:
+            closeKind[depth++] = RSquare;
+            break;
+        case RSquare:
+            if (closeKind[--depth] != RSquare) {
+                p.errorAt(next.loc, "expected ')'");
+            }
+            break;
+        case Eof:
+        case Semicolon:
+            return 0;   // probably a syntax error
+        default:
+            break;
+        }
+    }
+    return ahead;
+}
+
+/*
+  Syntax:
+    Number num = .     // id = type
+    utils.Type t = .  // id = module.type
+    myfunc()        // id = func
+    Mod.func()     // id = module.func
+    count =         // id = var
+    Mod.var =      // id = module.var
+    id:             // id = label
+*/
+fn Stmt* Parser.parseDeclOrStmt(Parser* p) {
+    assert(p.tok.kind == Identifier);
+    bool isDecl = p.isTypeSpec();
+
+    if (isDecl) {
+        // checkSemi, allowLocal, !isCondition
+        return p.parseDeclStmt(true, true, false);
+    }
+
+    Kind kind = p.peekToken(1);
+    if (kind == Colon) return p.parseLabelStmt();
+
+    return p.parseExprStmt();
+}
+
+fn CompoundStmt* Parser.parseCompoundStmt(Parser* p) {
+    p.expectAndConsume(LBrace);
+
+    StmtList* stmts = p.getStmtList();
+
+    while (p.tok.kind != RBrace) {
+        stmts.add(p.parseStmt());
+    }
+
+    SrcLoc endLoc = p.tok.loc + 1;
+    p.consumeRBrace();
+
+    CompoundStmt* s = p.builder.actOnCompoundStmt(endLoc, stmts.getData(), stmts.size());
+    p.putStmtList();
+
+    return s;
+}
+
+// Syntax (GNU extended asm statement)
+// asm-statement:
+//      'asm' type-qualifier[opt] '(' asm-argument ')' ';'
+//
+// asm-argument:
+//      asm-string-literal
+//      asm-string-literal ':' asm-operands[opt]
+//      asm-string-literal ':' asm-operands[opt] ':' asm-operands[opt]
+//      asm-string-literal ':' asm-operands[opt] ':' asm-operands[opt]
+//              ':' asm-clobbers
+//
+// asm-clobbers:
+//      asm-string-literal
+//      asm-clobbers ',' asm-string-literal
+//
+fn Stmt* Parser.parseAsmStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    u32 quals = p.parseOptionalTypeQualifier();
+    bool is_volatile = (quals == QualType_Volatile);
+    //TODO check allowed qualifiers
+
+    p.expectAndConsume(LParen);
+
+    p.expect(StringLiteral);
+    Expr* str = p.parseStringLiteral();
+
+    ExprList constraints.init();
+    ExprList exprs.init();
+    ExprList clobbers.init();
+
+    // Basic Asm stmt
+    if (p.tok.kind == RParen) {
+        p.consumeToken();
+        p.expectAndConsume(Semicolon);
+        Stmt* s = p.builder.actOnAsmStmt(loc,
+                                         true,
+                                         is_volatile,
+                                         0,
+                                         0,
+                                         nil,
+                                         &constraints,
+                                         &exprs,
+                                         &clobbers,
+                                         str);
+        constraints.free();
+        exprs.free();
+        clobbers.free();
+        return s;
+    }
+
+    StringList names.init(p.pool);
+
+    // Extended Asm stmt
+
+    // parse Outputs, if present
+    if (p.tok.kind == Colon) {
+        p.consumeToken();
+        p.parseAsmOperandsOpt(&names, &constraints, &exprs);
+    }
+
+    u32 num_outputs = names.length();
+
+    // parse Inputs, if present
+    if (p.tok.kind == Colon) {
+        p.consumeToken();
+        p.parseAsmOperandsOpt(&names, &constraints, &exprs);
+    }
+
+    u32 num_inputs = names.length() - num_outputs;
+
+    // parse Clobbers, if present
+    if (p.tok.kind == Colon) {
+        p.consumeToken();
+
+        // Parse the asm-string list for clobbers if present
+        if (p.tok.kind != RParen) {
+            while (1) {
+                p.expect(StringLiteral);
+                Expr* e = p.parseStringLiteral();
+                clobbers.add(e);
+                if (p.tok.kind != Comma) break;
+                p.consumeToken();
+            }
+        }
+    }
+
+    p.expectAndConsume(RParen);
+    p.expectAndConsume(Semicolon);
+
+    Stmt* s = p.builder.actOnAsmStmt(loc,
+                                     false,
+                                     is_volatile,
+                                     num_outputs,
+                                     num_inputs,
+                                     names.getData(),
+                                     &constraints,
+                                     &exprs,
+                                     &clobbers,
+                                     str);
+    names.free();
+    constraints.free();
+    exprs.free();
+    clobbers.free();
+    return s;
+}
+
+// Syntax:
+// asm-operands:
+//      asm-operand
+//      asm-operands ',' asm-operand
+//
+// asm-operand:
+//      asm-string_literal '(' expression ')'
+//      '[' identifier ']' asm-string_literal '(' expression ')'
+//
+fn void Parser.parseAsmOperandsOpt(Parser* p,
+                                   StringList* names,
+                                   ExprList* constraints,
+                                   ExprList* exprs) {
+    // 'asm-operands' isn't present
+    if (p.tok.kind != StringLiteral && p.tok.kind != LSquare) return;
+
+    while (1) {
+        // read the [id] if present
+        if (p.tok.kind == LSquare) {
+            p.consumeToken();
+
+            p.expectIdentifier();
+            u32 name = p.tok.name_idx;
+            //SrcLoc loc = p.tok.loc;
+            p.consumeToken();
+            names.add(name);
+            p.expectAndConsume(RSquare);
+        } else {
+            names.add(0);
+        }
+
+        p.expect(StringLiteral);
+        Expr* e = p.parseStringLiteral();
+        constraints.add(e);
+
+        // read the parenthesized expression
+        p.expectAndConsume(LParen);
+        e = p.parseExpr();
+        p.expectAndConsume(RParen);
+        exprs.add(e);
+
+        if (p.tok.kind != Comma) return;
+        p.consumeToken();
+    }
+}
+
+fn Stmt* Parser.parseAssertStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    p.expectAndConsume(LParen);
+    Expr* inner = p.parseExpr();
+    p.expectAndConsume(RParen);
+    p.expectAndConsume(Semicolon);
+    if (p.has_asserts) p.addImplicitImport(p.c2_assert_idx, false);
+    return p.builder.actOnAssertStmt(loc, inner);
+}
+
+fn Stmt* Parser.parseBreakStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    u32 name_idx = 0;
+    if (p.tok.kind == Identifier) {
+        name_idx = p.tok.name_idx;
+        p.consumeToken();
+    }
+    p.expectAndConsume(Semicolon);
+    return p.builder.actOnBreakStmt(loc, name_idx);
+}
+
+fn Stmt* Parser.parseContinueStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    u32 name_idx = 0;
+    if (p.tok.kind == Identifier) {
+        name_idx = p.tok.name_idx;
+        p.consumeToken();
+    }
+    p.expectAndConsume(Semicolon);
+    return p.builder.actOnContinueStmt(loc, name_idx);
+}
+
+fn Stmt* Parser.parseFallthroughStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    p.expectAndConsume(Semicolon);
+    return p.builder.actOnFallthroughStmt(loc);
+}
+
+fn Stmt* Parser.parseCondition(Parser* p) {
+    p.expectAndConsume(LParen);
+
+    Stmt* s;
+    if (p.isDeclaration()) {
+        // !checkSemi, !allowLocal, isCondition
+        s = p.parseDeclStmt(false, false, true);
+    } else {
+        Expr* cond = p.parseExpr();
+        s = cond.asStmt();
+    }
+    p.expectAndConsume(RParen);
+    return s;
+}
+
+fn Stmt* Parser.parseIfStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    p.expectAndConsume(LParen);
+
+    Stmt* decl = nil;
+    Expr* cond = nil;
+    if (p.isDeclaration()) {
+        p.keep_semi = true;
+        // !checkSemi, !allowLocal, isCondition
+        decl = p.parseDeclStmt(false, false, true);
+        p.keep_semi = false;
+        if (p.tok.kind == Semicolon) {
+            p.consumeToken();
+            cond = p.parseExpr();
+        }
+    } else {
+        cond = p.parseExpr();
+    }
+    p.expectAndConsume(RParen);
+
+    Stmt* then = p.parseStmt();
+
+    Stmt* else_stmt = nil;
+    if (p.tok.kind == KW_else) {
+        p.consumeToken();
+        else_stmt = p.parseStmt();
+    }
+
+    return p.builder.actOnIfStmt(loc, decl, cond, then, else_stmt);
+}
+
+fn Stmt* Parser.parseReturnStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    Expr* ret = (p.tok.kind == Semicolon) ? nil : p.parseInitExpr();
+
+    p.consumeSemicolon();
+    return p.builder.actOnReturnStmt(loc, ret);
+}
+
+fn Stmt* Parser.parseForStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    p.expectAndConsume(LParen);
+
+    // init
+    Stmt* init = nil;
+    if (p.tok.kind != Semicolon) {
+        // parseCondition
+        p.keep_semi = true;
+        if (p.isDeclaration()) {
+            // !checkSemi, !allowLocal, !isCondition
+            init = p.parseDeclStmt(false, false, false);
+        } else {
+            init = p.parseExpr().asStmt();
+        }
+        p.keep_semi = false;
+    }
+    p.expectAndConsume(Semicolon);
+
+    // cond
+    Expr* cond = nil;
+    if (p.tok.kind != Semicolon) {
+        p.keep_semi = true;
+        cond = p.parseExpr();
+        p.keep_semi = false;
+    }
+    p.expectAndConsume(Semicolon);
+
+    // incr
+    Expr* incr = nil;
+    if (p.tok.kind != RParen) {
+        incr = p.parseExpr();
+    }
+    p.expectAndConsume(RParen);
+
+    Stmt* body = p.parseStmt();
+
+    return p.builder.actOnForStmt(loc, init, cond, incr, body);
+}
+
+fn Stmt* Parser.parseWhileStmt(Parser* p) {
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+
+    Stmt* cond = p.parseCondition();
+    Stmt* then = p.parseStmt();
+
+    return p.builder.actOnWhileStmt(loc, cond, then);
+}
+
+fn Stmt* Parser.parseDeclStmt(Parser* p, bool checkSemi, bool allowLocal, bool isCondition) {
+    VarDecl*[MaxMultiDecl] decls;
+    u32 num_decls = 0;
+    bool is_static = p.tok.kind == KW_static;
+    bool has_tlocal = (p.tok.kind == KW_tlocal);
+    if (is_static | has_tlocal ) {
+        if (!allowLocal) p.error("keyword '%s' is not allowed here", p.tok.kind.name);
+        p.consumeToken();
+    }
+
+    TypeRefHolder ref.init();
+    p.parseTypeSpecifier(&ref);
+
+    for (;;) {
+        p.expectIdentifier();
+
+        u32 name = p.tok.name_idx;
+        u32 name_len = p.tok.len;
+        SrcLoc loc = p.tok.loc;
+        if (p.tok.reserved) {
+            p.diags.error(loc, "reserved word '%s' cannot be used as variable name",
+                          p.pool.idx2str(name));
+        }
+        p.consumeToken();
+
+        // TODO same as parseVarDecl()
+        bool has_init_call = false;
+        Expr* initValue = nil;
+        SrcLoc assignLoc = 0;
+
+        switch (p.tok.kind) {
+        case Equal:
+            assignLoc = p.tok.loc;
+            p.consumeToken();
+            initValue = p.parseInitExpr();
+            break;
+        case At:
+            p.error("local variables cannot have attributes");
+            break;
+        case Dot:
+            if (p.peekToken(1) == Identifier && p.peekToken(2) == LParen) {
+                if (is_static | has_tlocal) p.error("static local variables cannot have an init call");
+                if (isCondition) p.error("cannot use an init call inside a condition");
+                p.consumeToken();   // consume dot
+                Expr* func = p.builder.actOnMemberExpr(nil, name, name_len, p.tok.loc, p.tok.name_idx);
+                p.consumeToken();
+                initValue = p.parseCallExpr(func);
+                has_init_call = true;
+                break;
+            }
+            if (p.peekToken(1) == Identifier) {
+                p.consumeToken();
+                p.errorAt(p.tok.loc + p.tok.len, "missing argument list for init call");
+            }
+            p.error("expected identifier after '.'");
+            break;
+        case LSquare:
+            p.error("array indices should go after type");
+            break;
+        default:
+            break;
+        }
+        VarDecl* vd = p.builder.actOnVarDecl(name, loc, &ref, assignLoc, initValue, is_static, has_init_call);
+        if (has_tlocal) vd.setTLocal();
+        decls[num_decls++] = vd;
+        if (p.tok.kind != Comma)
+            break;
+        p.consumeToken();
+        if (isCondition)
+            p.error("cannot define multiple variables in a condition");
+        if (ref.isPointer() || ref.isArray())
+            p.error("pointer and array variables must be defined separately");
+        if (num_decls >= countof(decls))
+            p.error("too many variables defined in a single statement");
+    }
+    if (checkSemi) {
+        p.consumeSemicolon();
+    }
+    return p.builder.actOnDeclStmt(decls, num_decls);
+}
+
+fn Stmt* Parser.parseExprStmt(Parser* p) {
+    Expr* e = p.parseExpr();
+    p.consumeSemicolon();
+    return e.asStmt();
+}
+
+fn Stmt* Parser.parseLabelStmt(Parser* p) {
+    u32 name = p.tok.name_idx;
+
+    const char* label_name = p.pool.idx2str(name);
+    if (!islower(label_name[0])) {
+        p.error("a label name must start with a lower case character");
+    }
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken(); // identifier
+    p.expectAndConsume(Colon);
+    Stmt* stmt = nil;
+    switch (p.tok.kind) {
+    case RBrace:
+    case KW_case:
+    case KW_default:
+    case KW_fallthrough:
+        break;
+    default:
+        stmt = p.parseStmt();
+        break;
+    }
+    return p.builder.actOnLabelStmt(name, loc, stmt);
+}
+
+fn Stmt* Parser.parseGotoStmt(Parser* p) {
+    p.consumeToken();
+    p.expectIdentifier();
+    u32 name = p.tok.name_idx;
+    SrcLoc loc = p.tok.loc;
+    p.consumeToken();
+    p.expectAndConsume(Semicolon);
+    return p.builder.actOnGotoStmt(name, loc);
+}
+
+fn bool Parser.isDeclaration(Parser* p) {
+    const Kind kind = p.tok.kind;
+    if (kind == Identifier) return p.isTypeSpec();
+    if (kind.isTypeKeyword() && (p.peekToken(1) != Dot)) return true;
+    if (kind == KW_static || kind == KW_tlocal) return true;
+    if (kind.isQualifier()) return true;
+    return false;
+}
+

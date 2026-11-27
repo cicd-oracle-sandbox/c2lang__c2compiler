@@ -1,0 +1,69 @@
+module sdl_ttf extern "C";
+
+import sdl;
+
+int init() @(cname="TTF_Init");
+void quit() @(cname="TTF_Quit");
+
+type Font struct @(cname="TTF_Font", opaque);
+
+Font* openFont(const char* file, int ptsize) @(cname="TTF_OpenFont");
+void Font.close(Font* font) @(cname="TTF_CloseFont");
+int Font.setSize(Font* font, int ptsize) @(cname="TTF_SetFontSize");
+
+// Font style flags
+const u32 STYLE_NORMAL        = 0x00;
+const u32 STYLE_BOLD          = 0x01;
+const u32 STYLE_ITALIC        = 0x02;
+const u32 STYLE_UNDERLINE     = 0x04;
+const u32 STYLE_STRIKETHROUGH = 0x08;
+
+int Font.getStyle(const Font* font) @(cname="TTF_GetFontStyle");
+void Font.setStyle(Font* font, int style) @(cname="TTF_GetFontStyle");
+int Font.getOutline(const Font* font) @(cname="TTF_GetFontOutline");
+void Font.setOutline(Font* font, int outline) @(cname="TTF_SetFontOutline");
+
+// Hinting flags
+const u32 HINTING_NORMAL          = 0;
+const u32 HINTING_LIGHT           = 1;
+const u32 HINTING_MONO            = 2;
+const u32 HINTING_NONE            = 3;
+const u32 HINTING_LIGHT_SUBPIXEL  = 4;
+
+int Font.getHinting(const Font* font) @(cname="TTF_GetFontHinting");
+void Font.setHinting(Font* font, int hinting) @(cname="TTF_SetFontHinting");
+
+// Special layout option for rendering wrapped text
+const u32 WRAPPED_ALIGN_LEFT      = 0;
+const u32 WRAPPED_ALIGN_CENTER    = 1;
+const u32 WRAPPED_ALIGN_RIGHT     = 2;
+
+int Font.getWrappedAlign(const Font* font) @(cname="TTF_GetFontWrappedAlign");
+void Font.setWrappedAlign(Font* font, int align) @(cname="TTF_SetFontWrappedAlign");
+int Font.height(const Font* font) @(cname="TTF_FontHeight");
+int Font.sizeText(Font* font, const char* text, int* w, int* h) @(cname="TTF_SizeText");
+int Font.measureText(Font* font, const char* text, int measure_width, int* extent, int* count) @(cname="SDLCALL TTF_MeasureText");
+
+sdl.Surface* Font.renderSolid(Font* font, const char* text, sdl.Color fg) @(cname="TTF_RenderText_Solid");
+
+sdl.Surface* Font.renderSolid_Wrapped(Font* font, const char* text, sdl.Color fg, u32 wrapLength)
+    @(cname="TTF_RenderText_Solid_Wrapped");
+
+sdl.Surface* Font.renderShaded(Font* font, const char* text, sdl.Color fg, sdl.Color bg)
+    @(cname="TTF_RenderText_Shaded");
+
+sdl.Surface* Font.renderShadedWrapped(Font* font, const char* text, sdl.Color fg, sdl.Color bg, u32 wrapLength)
+    @(cname="TTF_RenderText_Shaded_Wrapped");
+
+sdl.Surface* Font.renderBlended(Font* font, const char* text, sdl.Color fg)
+    @(cname="TTF_RenderText_Blended");
+
+sdl.Surface* Font.renderBlendedWrapped(Font* font, const char* text, sdl.Color fg, u32 wrapLength)
+    @(cname="TTF_RenderText_Blended_Wrapped");
+
+sdl.Surface* Font.renderLCD(Font* font, const char* text, sdl.Color fg, sdl.Color bg)
+    @(cname="TTF_RenderText_LCD");
+
+sdl.Surface* Font.renderLCDWrapped(Font* font, const char* text, sdl.Color fg, sdl.Color bg, u32 wrapLength)
+    @(cname="TTF_RenderText_LCD");
+

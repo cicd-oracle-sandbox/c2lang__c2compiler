@@ -1,0 +1,147 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module attr;
+
+import src_loc { SrcLoc }
+import string_pool { StringPool }
+
+// note: keep Attr prefix because Kind already exists a lot
+public type AttrKind enum u8 (const char* const name, const AttrReq required_arg) {
+    Unknown      : { "?",             NoArg },
+    Export       : { "export",        NoArg },  // Type | Func | Var
+    Packed       : { "packed",        NoArg },  // Struct
+    Unused       : { "unused",        NoArg },  // Type | Func | Var
+    UnusedParams : { "unused_params", NoArg },  // Type | Func
+    Section      : { "section",       String }, //        Func | Var, needs string arg
+    NoReturn     : { "noreturn",      NoArg },  //        Func
+    Inline       : { "inline",        NoArg },  //        Func
+    PrintfFormat : { "printf_format", NoArg },  //             | Var, function param only
+    ScanfFormat  : { "scanf_format",  NoArg },  //             | Var, function param only
+    Aligned      : { "aligned",       Number }, // Type | Func | Var, needs number arg
+    Weak         : { "weak",          NoArg },  //        Func | Var
+    Opaque       : { "opaque",        NoArg },  // Struct
+    CName        : { "cname",         String }, // Type | Func | Var, only in interface, needs string arg
+    CDef         : { "cdef",          String }, // Type | Func | Var, only in interface, needs string arg
+    NoTypeDef    : { "no_typedef",    NoArg },  // Type, only interface files
+    Constructor  : { "constructor",   NoArg },  //        Func
+    Destructor   : { "destructor",    NoArg },  //        Func
+    Pure         : { "pure",          NoArg },  //        Func
+    AutoFile     : { "auto_file",     NoArg },  //               Var, function param only
+    AutoLine     : { "auto_line",     NoArg },  //               Var, function param only
+    AutoFunc     : { "auto_func",     NoArg },  //               Var, function param only
+    AutoExpr     : { "auto_expr",     NoArg },  //               Var, function param only
+    Embed        : { "embed",         String }, //               Var, globals only
+    Deprecated   : { "deprecated",    String }, //        Func
+}
+
+public type AttrValueKind enum u8 {
+    None,
+    Number,
+    String,
+}
+
+// Note: Value itself does not need to know the kind
+public type AttrValue struct {
+    SrcLoc loc;
+    union {
+        u32 text;
+        u32 number;
+    }
+}
+
+public type Attr struct {
+    void* decl;
+    u32 name;  // needed for unknown attributes
+    SrcLoc loc;
+    AttrKind kind;
+    AttrValueKind value_kind;
+    AttrValue value;
+}
+static_assert(32, sizeof(Attr));
+
+// Note: only meant for printing (since not allocated in StringPool)
+public fn const char* Attr.kind2name(const Attr* a) {
+    return a.kind.name;
+}
+
+public type AttrRegistry struct {
+    u32[AttrKind] name_indexes;
+}
+
+public fn void AttrRegistry.init(AttrRegistry* ar, StringPool* pool) {
+    // skip unknown attribute
+    AttrKind kind = (AttrKind)0;
+    ar.name_indexes[kind++] = 0;
+    for (; kind <= AttrKind.max; kind++) {
+        ar.name_indexes[kind] = pool.addStr(kind.name, true);
+    }
+}
+
+public fn AttrKind AttrRegistry.find(AttrRegistry* ar, u32 name_idx) {
+    // skip unknown
+    for (AttrKind kind = (AttrKind)1; kind <= AttrKind.max; kind++) {
+        if (name_idx == ar.name_indexes[kind]) return kind;
+    }
+    return Unknown;
+}
+
+public type AttrReq enum u8 {
+    NoArg = 0,
+    Arg,
+    Number,
+    String,
+    Power2,
+    Ok,
+}
+
+fn bool isPowerOf2(u32 val) {
+    return val && !(val & (val - 1));
+}
+
+public fn AttrReq Attr.checkArgument(const Attr* a) {
+    switch (a.kind.required_arg) {
+    case NoArg:
+        if (a.value_kind != None) return NoArg;
+        break;
+    case Number:
+        switch (a.value_kind) {
+        case None:
+            return Arg;
+        case Number:
+            if (a.kind == Aligned) {
+                if (!isPowerOf2(a.value.number)) return Power2;
+            }
+            break;
+        case String:
+            return Number;
+        }
+        break;
+    case String:
+        switch (a.value_kind) {
+        case None:
+            return Arg;
+        case Number:
+            return String;
+        case String:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return Ok;
+}
+

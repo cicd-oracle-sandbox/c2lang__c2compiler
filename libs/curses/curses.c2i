@@ -1,0 +1,14 @@
+module curses extern "C";
+
+typedef unsigned int chtype;
+struct SCREEN @(opaque, cname="screen") {}
+struct WINDOW @(opaque, cname="_win_st") {}
+
+WINDOW *initscr(void);
+int getch(void);
+int cbreak(void);
+int noecho(void);
+int clear(void);
+int endwin(void);
+int refresh(void);
+int mvaddch(int y, int x, chtype ch);

@@ -1,0 +1,62 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type AssertStmt struct @(opaque) {
+    Stmt base;
+    Expr* inner;
+    Expr* call;
+}
+
+public fn AssertStmt* AssertStmt.create(Context* c,
+                                        SrcLoc loc,
+                                        Expr* inner,
+                                        Expr* call)
+{
+    AssertStmt* s = c.alloc(sizeof(AssertStmt));
+    s.base.init(Assert, loc);
+    s.inner = inner;
+    s.call = call;
+#if AstStatistics
+    Stats.addStmt(Assert, sizeof(AssertStmt));
+#endif
+    return s;
+}
+
+fn Stmt* AssertStmt.instantiate(AssertStmt* s, Instantiator* inst) {
+    return (Stmt*)AssertStmt.create(inst.c, s.base.loc, s.inner.instantiate(inst),
+                                    s.call ? s.call.instantiate(inst) : nil);
+}
+
+public fn Expr* AssertStmt.getInner(const AssertStmt* s) { return s.inner; }
+
+public fn Expr** AssertStmt.getInner2(AssertStmt* s) { return &s.inner; }
+
+public fn Expr* AssertStmt.getCall(const AssertStmt* s) { return s.call; }
+
+public fn Expr** AssertStmt.getCall2(AssertStmt* s) { return &s.call; }
+
+fn void AssertStmt.print(const AssertStmt* s, StringBuf* out, u32 indent) {
+    s.base.printKind(out, indent);
+    out.newline();
+    s.inner.print(out, indent + 1);
+    if (s.call) s.call.print(out, indent + 1);
+}
+

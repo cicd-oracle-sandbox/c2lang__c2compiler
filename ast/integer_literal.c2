@@ -1,0 +1,132 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import number_radix { Radix }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+import value_type { Value }
+
+type IntegerLiteralBits struct @(packed) {
+    u32 : NumExprBits;
+    Radix radix : 2;
+    u32 src_len : 32 - NumExprBits - 2;
+}
+static_assert(4, sizeof(IntegerLiteralBits));
+
+public type IntegerLiteral struct @(opaque) {
+    Expr base;
+    u64 val;
+}
+
+public fn IntegerLiteral* IntegerLiteral.create(Context* c, SrcLoc loc, u32 src_len, u64 val, Radix radix, BuiltinKind kind) {
+    IntegerLiteral* i = c.alloc(sizeof(IntegerLiteral));
+    i.base.init(IntegerLiteral, loc, 1, 1, 0, RValue);
+    i.base.base.integerLiteralBits.radix = radix;
+    i.base.base.integerLiteralBits.src_len = src_len;
+    i.val = val;
+#if AstStatistics
+    Stats.addExpr(IntegerLiteral, sizeof(IntegerLiteral));
+#endif
+    i.base.setType(getBuiltinQT(kind));
+    return i;
+}
+
+fn Value IntegerLiteral.getValue(const IntegerLiteral* e) {
+    return Value.createUnsigned(e.val);
+}
+
+fn SrcLoc IntegerLiteral.getEndLoc(const IntegerLiteral* e) {
+    return e.base.base.loc + e.base.base.integerLiteralBits.src_len;
+}
+
+fn u32 IntegerLiteral.getSrcLen(const IntegerLiteral* e) {
+    return e.base.base.integerLiteralBits.src_len;
+}
+
+public fn bool IntegerLiteral.isDecimal(const IntegerLiteral* e) {
+    return e.base.base.integerLiteralBits.radix == Default;
+}
+
+fn void printBinary(StringBuf* out, u64 value, u32 len) {
+    char[2+64+1] tmp;
+    char* cp = &tmp[countof(tmp) - 1];
+    if (len < 3) len = 3;
+    if (len > 66) len = 66;
+    *cp = '\0';
+    for (u32 i = 2; value || i < len; i++) {
+        *--cp = '0' + (value & 0x1);
+        value /= 2;
+    }
+    *--cp = 'b';
+    *--cp = '0';
+    out.add(cp);
+}
+
+fn void printOctal(StringBuf* out, u64 value, u32 len) {
+    char[1+22+1] tmp;
+    char* cp = &tmp[countof(tmp) - 1];
+    if (len < 1) len = 1;
+    if (len > 23) len = 23;
+    *cp = '\0';
+    for (u32 i = 1; value || i < len; i++) {
+        *--cp = '0' + (value & 0x7);
+        value /= 8;
+    }
+    *--cp = '0';
+    out.add(cp);
+}
+
+fn void printHex(StringBuf* out, u64 value, u32 len) {
+    if (len < 3) len = 3;
+    if (len > 18) len = 18;
+    out.print("0x%.*X", (i32)len - 2, value);
+}
+
+fn void IntegerLiteral.print(const IntegerLiteral* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.color(col_Value);
+    out.space();
+    e.printLiteral(out, false);
+    out.newline();
+}
+
+public fn void IntegerLiteral.printLiteral(const IntegerLiteral* e, StringBuf* out, bool c_style = false) {
+    // Attempt to generate the same number of digits. Output may be smaller if source has digit separators
+    switch (e.base.base.integerLiteralBits.radix) {
+    case Default:
+        out.print("%d", e.val);
+        break;
+    case Hex:
+        printHex(out, e.val, e.getSrcLen());
+        break;
+    case Octal:
+        printOctal(out, e.val, e.getSrcLen());
+        break;
+    case Binary:
+        printBinary(out, e.val, e.getSrcLen());
+        break;
+    }
+    if (c_style) {
+        QualType qt = e.base.getType();
+        BuiltinKind kind = qt.getBuiltinKind();
+        if (kind == UInt32 || kind == UInt64) out.add1('U');
+        if (kind == Int64 || kind == UInt64) out.add1('L');
+    }
+}
+

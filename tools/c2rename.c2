@@ -1,0 +1,156 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module refs_main;
+
+import c2refs { Dest, Refs }
+import constants { Refs_filename, output_dir }
+import file_utils { Pathname }
+import replacer { Replacer }
+import refs_finder { Finder }
+import utils;
+
+import c_errno { errno }
+import stdio { printf, fprintf, stderr }
+import stdlib { atoi, exit, EXIT_FAILURE }
+import string { pstrcpy, strerror }
+
+type Options struct {
+    const char* target;
+    const char* newname;
+    const char* symbolname;
+    const char* filename;
+    u32 line;
+    u16 column;
+}
+
+Options opts;
+
+fn void usage(const char* me) {
+    printf("Usage: %s [old-name] [new-name] <opts>\n", me);
+    printf("  old-name can be specified by:\n");
+    printf("    [file] [line] [col]\n");
+    printf("    [<module>.symbol] ]\n");
+    printf("  Options:\n");
+    printf("    -t [target]             use [target]\n");
+    exit(-1);
+}
+
+fn void parse_options(i32 argc, const char** argv) {
+    const char*[4] args = { nil }
+    u32 pos_count = 0;
+    i32 i = 1;
+    while (i<argc) {
+        const char* arg = argv[i];
+        if (arg[0] == '-') {
+            if (arg[1] != 't') usage(argv[0]);
+            i++;
+            if (i == argc) usage(argv[0]);
+            opts.target = argv[i];
+        } else {
+            if (pos_count >= 4) usage(argv[0]);
+
+            args[pos_count] = arg;
+            pos_count++;
+        }
+        i++;
+    }
+
+    if (pos_count == 2) {
+        opts.symbolname = args[0];
+        opts.newname = args[1];
+    } else if (pos_count == 4) {
+        opts.filename= args[0];
+        opts.line = (u32)atoi(args[1]);
+        opts.column = (u16)atoi(args[2]);
+        opts.newname = args[3];
+    } else {
+        usage(argv[0]);
+    }
+}
+
+fn void use_fn(void* arg, const Dest* res) {
+    if (!res.filename) return; // symbol/location not found
+    Replacer* r = arg;
+    r.add(res.filename, res.line, res.col);
+}
+
+fn u16 find_len(const char* symbol) {
+    u16 len = 0;
+    const char* cp = symbol;
+    while (*cp) {
+        len++;
+        if (*cp == '.') len = 0;
+        cp++;
+    }
+    return len;
+}
+
+public fn i32 main(i32 argc, const char** argv)
+{
+    parse_options(argc, argv);
+
+    if (!utils.findProjectDir(nil)) {
+        fprintf(stderr, "cannot find C2 root dir\n");
+        return -1;
+    }
+
+    const char* refsfile = Refs_filename;
+    Pathname refsname;
+    if (opts.target) {
+        refsname.init_subdir(output_dir, opts.target, Refs_filename);
+        refsfile = refsname.path;
+    } else {
+        Finder* finder = Finder.create(output_dir, Refs_filename);
+        u32 count = finder.search(nil);
+
+        if (count == 0) {
+            fprintf(stderr, "no %s files found\n", Refs_filename);
+            return -1;
+        }
+        if (count == 1) {
+            refsname.init(finder.get(0));
+            refsfile = refsname.path;
+        } else {
+            fprintf(stderr, "multiple %s files, please specify target with '-t' option\n", Refs_filename);
+            return -1;
+        }
+        finder.free();
+    }
+
+    Refs* refs = Refs.load(refsfile, false);
+    if (!refs) {
+        fprintf(stderr, "error loading %s: %s\n", refsfile, strerror(errno));
+        return -1;
+    }
+
+    Replacer* r = Replacer.create(opts.newname);
+
+    u16 old_len = 0;
+    if (opts.symbolname) {
+        refs.findSymbolUses(opts.symbolname, use_fn, r);
+        old_len = find_len(opts.symbolname);
+    } else {
+        Dest origin = { .filename=opts.filename, .line=opts.line, .col=opts.column }
+        refs.findRefUses(&origin, use_fn, r, &old_len);
+    }
+
+    // when replacing module.symbol, old len should be strlen(symbol)
+    i32 ret = r.replace(old_len);
+    refs.free();
+    r.free();
+    return ret;
+}
+

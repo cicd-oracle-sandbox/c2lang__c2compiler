@@ -1,0 +1,82 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+type StringLiteralBits struct {
+    u32 : NumExprBits;
+    u32 src_len : 32 - NumExprBits;
+}
+static_assert(4, sizeof(StringLiteralBits));
+
+public type StringLiteral struct @(opaque) {
+    Expr base;
+    u32 value;
+    u32 len; // Note: no cost on 64-bit systems because of padding
+}
+
+public fn StringLiteral* StringLiteral.create(Context* c,
+                                              SrcLoc loc,
+                                              u32 src_len,
+                                              u32 value,
+                                              u32 len,
+                                              bool addnull = true) {
+    StringLiteral* e = c.alloc(sizeof(StringLiteral));
+    e.base.init(StringLiteral, loc, 0, 1, 0, LValue);
+    e.base.base.stringLiteralBits.src_len = src_len;
+    e.value = value;
+    e.len = len;   // null terminator is present at the end of the string in the string pool
+#if AstStatistics
+    Stats.addExpr(StringLiteral, sizeof(StringLiteral));
+#endif
+    e.base.setType(getStringType(len + addnull));
+    return e;
+}
+
+public fn u32 StringLiteral.getText(const StringLiteral* e) {
+    return e.value;
+}
+
+// get the length of the string literal: includes the null terminator
+public fn u32 StringLiteral.getSize(const StringLiteral* e) {
+    return e.len + 1;
+}
+
+// get the length of the string literal: this may include embedded null bytes
+public fn u32 StringLiteral.getLength(const StringLiteral* e) {
+    return e.len;
+}
+
+fn SrcLoc StringLiteral.getEndLoc(const StringLiteral* e) {
+    return e.base.base.loc + e.base.base.stringLiteralBits.src_len;
+}
+
+public fn void StringLiteral.printLiteral(const StringLiteral* e, StringBuf* out) {
+    out.encodeBytes(idx2name(e.value), e.len, '"');
+}
+
+fn void StringLiteral.print(const StringLiteral* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.space();
+    out.color(col_Value);
+    e.printLiteral(out);
+    out.newline();
+}
+

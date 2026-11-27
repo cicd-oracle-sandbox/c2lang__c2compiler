@@ -1,0 +1,4 @@
+module test;
+
+public fn void test1(static i32 a) {}  // @error{keyword 'static' is not allowed here}
+

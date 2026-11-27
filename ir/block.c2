@@ -1,0 +1,85 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ir;
+
+import string { memset }
+
+public type BlockKind enum u8 (const char* const name) {
+    Unspecified     : { "" },
+    FnStart         : { "start" },
+    WhileCond       : { "while_cond" },
+    WhileBody       : { "while_body" },
+    WhileJoin       : { "while_join" },
+    ForCond         : { "for_cond" },
+    ForBody         : { "for_body" },
+    ForCont         : { "for_cont" },
+    ForJoin         : { "for_join" },
+    IfTrue          : { "if_true" },
+    IfFalse         : { "if_false" },
+    IfJoin          : { "if_join" },
+    AndTrue         : { "and_true" },
+    LogicJoin       : { "logic_join" },
+    OrFalse         : { "or_false" },
+    CondTrue        : { "cond_true" },
+    CondFalse       : { "cond_false" },
+    CondJoin        : { "cond_join" },
+    Label           : { "label" },
+    SwitchCond      : { "switch_cond" },
+    SwitchCase      : { "switch_case" },
+    SwitchJoin      : { "switch_join" },
+    SwitchDefault   : { "switch_default" },
+    PhiSplit        : { "phi_split" },
+}
+
+public type Block struct {
+    BlockId[2] dests;   // used if not 0
+    Index instr;        // index into FuncInfo.instructions
+    BlockKind kind : 8 ;   // BlockKind
+    u32 used : 1;
+    u32 checked : 1;    // can be used during various passes
+    u32 end_with_switch : 1;
+    u32 phi_source : 1;
+    u32 end_block : 1;  // ends with exit/ret, no successors
+}
+static_assert(20, sizeof(Block));
+
+fn void Block.init(Block* b, BlockKind kind) {
+    memset(b, 0, sizeof(Block));
+    b.kind = kind;
+}
+
+fn BlockKind Block.getKind(const Block* b) {
+    return b.kind;
+}
+
+public fn const char* Block.getKindName(const Block* b) {
+    return b.getKind().name;
+}
+
+public fn void Block.setInstructions(Block* b, u32 start, u32 count) {
+    b.instr.start = start;
+    b.instr.count = count;
+}
+
+public fn Index Block.getInstructions(const Block* b) {
+    return b.instr;
+}
+
+public fn void Block.setDest(Block* b, BlockId dest1, BlockId dest2) {
+    b.dests[0] = dest1;
+    b.dests[1] = dest2;
+}
+

@@ -1,0 +1,170 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2loc_main;
+
+import build_target { BuildTarget }
+import c2recipe { Recipe }
+import constants { recipe_name }
+import file_list { File }
+import source_mgr { SourceMgr }
+import string_pool { StringPool }
+
+import c_errno { errno }
+import stdio { printf, fprintf, FILE, stdout, stderr }
+import stdlib { exit, EXIT_FAILURE }
+import string { strerror, strcmp }
+import unistd { chdir, isatty }
+
+const char* target;
+const char* other_dir;
+bool verbose;
+bool use_color;
+
+fn void usage(const char* me, FILE *fp) {
+    fprintf(fp,
+            "Usage: %s <options> <target>\n"
+            "Options:\n"
+            "   -d [dir]         change to [dir] first\n"
+            "   -h  --help       print this help\n"
+            "       --color      force colorized output\n"
+            "       --no-color   disable colorized output\n"
+            "   -v  --verbose    verbose (show lines per source file)\n"
+            , me);
+}
+
+fn void parse_opts(i32 argc, const char** argv) {
+    for (i32 i=1; i<argc; i++) {
+        const char* arg = argv[i];
+        if (arg[0] == '-') {
+            switch (arg) {
+            case "-d":
+                if (i == argc - 1) {
+                    fprintf(stderr, "%s: missing directory after '-d'\n", argv[0]);
+                    exit(EXIT_FAILURE);
+                }
+                i++;
+                other_dir = argv[i];
+                break;
+            case "-h":
+            case "--help":
+                usage(argv[0], stdout);
+                exit(EXIT_FAILURE);
+                break;
+            case "--color":
+                use_color = true;
+                break;
+            case "--no-color":
+                use_color = false;
+                break;
+            case "-v":
+            case "--verbose":
+                verbose = true;
+                break;
+            default:
+                fprintf(stderr, "%s: unknown option '%s'\n", argv[0], arg);
+                usage(argv[0], stderr);
+                exit(EXIT_FAILURE);
+                break;
+            }
+        } else {
+            if (target) {
+                fprintf(stderr, "%s: too many arguments\n", argv[0]);
+                usage(argv[0], stderr);
+                exit(EXIT_FAILURE);
+            }
+            target = arg;
+        }
+    }
+}
+
+fn u32 count_loc(const char* data) {
+    u32 loc = 0;
+    while (*data) {
+        if (*data == '\n') loc++;
+        data++;
+    }
+    return loc;
+}
+
+fn void handle_target(BuildTarget* t, const char* name, SourceMgr* sm, StringPool* pool) {
+    if (verbose) printf("%s: %d files\n", name, t.numFiles());
+    u32 total_loc = 0;
+    for (u32 i=0; i<t.numFiles(); i++) {
+        const File* file = t.getFile(i);
+        const char* filename = pool.idx2str(file.name);
+        i32 file_id = sm.loadFile(filename, 0);
+        if (file_id == -1) return;
+
+        const char* data = sm.get_content(file_id);
+        u32 loc = count_loc(data);
+        total_loc += loc;
+        if (verbose) {
+            printf("  %6d %s\n", loc, filename);
+        }
+    }
+    if (verbose) {
+        printf("total %d loc\n", total_loc);
+    } else {
+        printf("%-16s: %4d files, %5d loc\n", name, t.numFiles(), total_loc);
+    }
+}
+
+public fn i32 main(i32 argc, const char** argv)
+{
+    i32 status = 0;
+
+    use_color = isatty(1);
+
+    parse_opts(argc, argv);
+
+    if (other_dir) {
+        if (chdir(other_dir)) {
+            fprintf(stderr, "%s: cannot chdir to %s: %s\n",
+                    argv[0], other_dir, strerror(errno));
+            return EXIT_FAILURE;
+        }
+    }
+
+    StringPool* pool = StringPool.create(32*1024, 1024);
+    SourceMgr* sm = SourceMgr.create(pool, use_color);
+    Recipe* recipe = Recipe.create(sm, pool, use_color);
+
+    i32 file_id = sm.loadFile(recipe_name, 0);
+    if (file_id == -1) return EXIT_FAILURE;
+    if (!recipe.parse(file_id)) return EXIT_FAILURE;
+
+    bool found = false;
+    for (u32 i=0; i<recipe.numTargets(); i++) {
+        BuildTarget* t = recipe.getTarget(i);
+        const char* target_name = pool.idx2str(t.getNameIdx());
+        if (target && strcmp(target, target_name) != 0) continue;
+        found = true;
+
+        handle_target(t, target_name, sm, pool);
+        sm.clear(file_id);
+    }
+
+    if (target && !found) {
+        fprintf(stderr, "%s: no such target in %s\n", argv[0], recipe_name);
+        status = EXIT_FAILURE;
+    }
+
+    recipe.free();
+    sm.free();
+
+    return status;
+}
+

@@ -1,0 +1,213 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module utils;
+
+import stdio { vsnprintf }
+import stdlib { malloc, free }
+import string { memcpy, strlen }
+
+public type StringBuffer struct {
+    u32 capacity;
+    u32 len;
+    char* data_ptr;
+    bool own;       // data_ptr should be freed
+    bool grow;      // data_ptr should be reallocated
+    bool truncated @(unused);
+    bool error @(unused);
+}
+
+static_assert(24, sizeof(StringBuffer));
+
+public fn StringBuffer* StringBuffer.init(StringBuffer* buf,
+                                          u32 capacity,
+                                          char *data = nil,
+                                          bool grow = true) @(unused)
+{
+    buf.capacity = capacity;
+    buf.len = 0;
+    buf.data_ptr = data;
+    buf.own = false;
+    buf.grow = grow;
+    buf.truncated = false;
+    buf.error = false;
+    if (!data && capacity) {
+        buf.data_ptr = malloc(capacity);
+        buf.own = true;
+    }
+    return buf;
+}
+
+public fn void StringBuffer.deinit(StringBuffer* buf) @(unused) {
+    if (buf.own) free(buf.data_ptr);
+    buf.data_ptr = nil;
+}
+
+public fn StringBuffer* StringBuffer.create(u32 capacity, char *data = nil, bool grow = true) @(unused) {
+    StringBuffer* buf = malloc(sizeof(StringBuffer));
+    return buf.init(capacity, data, grow);
+}
+
+public fn void StringBuffer.destroy(StringBuffer* buf) @(unused) {
+    if (buf) {
+        buf.deinit();
+        free(buf);
+    }
+}
+
+public fn u32 StringBuffer.size(const StringBuffer* buf) @(unused) {
+    return buf.len;
+}
+
+public fn const char* StringBuffer.data(StringBuffer* buf) {
+    if (buf.len < buf.capacity) buf.data_ptr[buf.len] = '\0';
+    return buf.data_ptr;
+}
+
+public fn void StringBuffer.clear(StringBuffer* buf) @(unused) {
+    buf.len = 0;
+    buf.truncated = false;
+}
+
+public fn void StringBuffer.putc(StringBuffer* buf, char c) @(unused) {
+    if (buf.len + 2 > buf.capacity) {
+        if (!buf.extend(1)) return;
+    }
+    buf.data_ptr[buf.len++] = c;
+}
+
+public fn void StringBuffer.putwc(StringBuffer* buf, i32 c) @(unused) {
+    if (c < 0x80) {
+        buf.putc((char)c);
+    } else {
+        char[4] arr;
+        u32 len = 0;
+        if (c < 0x800) {
+            arr[len++] = (char)((c >> 6) | 0xc0);
+        } else {
+            if (c < 0x10000) {
+                arr[len++] = (char)((c >> 12) | 0xe0);
+            } else {
+                arr[len++] = (char)((c >> 18) | 0xf0);
+                arr[len++] = (char)(((c >> 12) & 0x3f) | 0x80);
+            }
+            arr[len++] = (char)(((c >> 6) & 0x3f) | 0x80);
+        }
+        arr[len++] = (char)((c & 0x3f) | 0x80);
+        buf.add2(arr, len);
+    }
+}
+
+public fn void StringBuffer.add(StringBuffer* buf, const char* text) @(unused) {
+    u32 len = (u32)strlen(text);
+    buf.add2(text, len);
+}
+
+public fn void StringBuffer.add2(StringBuffer* buf, const char* text, u32 len) @(unused) {
+    if (buf.len + len + 1 > buf.capacity) {
+        // truncate if resize fails.
+        if (!buf.extend(len)) {
+            u32 size = buf.capacity - buf.len;
+            if (!size) return;
+            len = size - 1;
+        }
+    }
+    memcpy(&buf.data_ptr[buf.len], text, len);
+    buf.len += len;
+}
+
+public fn void StringBuffer.printf(StringBuffer* buf, const char* format @(printf_format), ...) @(unused) {
+    va_list args;
+    va_start(args, format);
+    buf.vprintf(format, args);
+    va_end(args);
+}
+
+public fn void StringBuffer.vprintf(StringBuffer* buf, const char* format, va_list args) @(unused) {
+    // formatted output is limited to 4095 bytes
+    char[4096] tmp;
+    char* dest = tmp;
+    u32 dest_size = countof(tmp);
+    u32 avail = buf.capacity - buf.len;
+    if (!buf.grow || avail >= 4096) {
+        if (!avail) {
+            buf.truncated = true;
+            return;
+        }
+        dest = &buf.data_ptr[buf.len];
+        dest_size = avail;
+    }
+    i32 ret = vsnprintf(dest, dest_size, format, args);
+    if (ret < 0) {
+        buf.error = true;
+        return;
+    }
+    u32 len = (u32)ret;
+    if (len >= dest_size) {
+        buf.truncated = true;
+        len = dest_size - 1;    // we know that dest_size > 0
+    }
+    if (dest == tmp) {
+        if (len >= avail) {
+            buf.add2(tmp, len);
+        } else {
+            memcpy(&buf.data_ptr[buf.len], tmp, len);
+            buf.len += len;
+        }
+    } else {
+        // output is already in buffer
+        buf.len += len;
+    }
+}
+
+fn bool StringBuffer.extend(StringBuffer* buf, u32 len) @(unused) {
+    if (!buf.grow) {
+        buf.truncated = true;
+        return false;
+    }
+    u32 new_cap = buf.capacity ? buf.capacity * 2 : 256;
+    while (buf.len + len >= new_cap) {
+        new_cap *= 2;
+        if (new_cap <= buf.capacity) {
+            buf.error = true;
+            return false;
+        }
+    }
+    char* data2 = malloc(new_cap);
+    if (!data2) {
+        buf.error = true;
+        return false;
+    }
+    buf.capacity = new_cap;
+    memcpy(data2, buf.data_ptr, buf.len);
+    if (buf.own) free(buf.data_ptr);
+    buf.data_ptr = data2;
+    buf.own = true;
+    return true;
+}
+
+public fn void StringBuffer.indent(StringBuffer* buf, u32 indent) @(unused) {
+    if (buf.len + indent + 1 > buf.capacity) {
+        // truncate if resize fails.
+        if (!buf.extend(indent)) {
+            u32 size = buf.capacity - buf.len;
+            if (!size) return;
+            indent = size - 1;
+        }
+    }
+    char* cur = buf.data_ptr + buf.len;
+    for (u32 i = 0; i < indent; i++) cur[i] = ' ';
+    buf.len += indent;
+}

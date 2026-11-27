@@ -1,0 +1,62 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+type ContinueStmtBits struct {
+    u32 : NumStmtBits;
+    u32 has_name: 1;
+}
+static_assert(4, sizeof(ContinueStmtBits));
+
+public type ContinueStmt struct @(opaque) {
+    Stmt base;
+    u32[] name_idx;
+}
+
+public fn ContinueStmt* ContinueStmt.create(Context* c, SrcLoc loc, u32 name_idx) {
+    u32 size = sizeof(ContinueStmt);
+    if (name_idx) size += sizeof(u32);
+    ContinueStmt* s = c.alloc(size);
+    s.base.init(Continue, loc);
+    if (name_idx) {
+        s.base.breakStmtBits.has_name = true;
+        s.name_idx[0] = name_idx;
+    }
+#if AstStatistics
+    Stats.addStmt(Continue, size);
+#endif
+    return s;
+}
+
+public fn bool ContinueStmt.hasName(const ContinueStmt* s) {
+    return s.base.continueStmtBits.has_name;
+}
+
+public fn u32 ContinueStmt.getName(const ContinueStmt* s) {
+    if (s.base.continueStmtBits.has_name) return s.name_idx[0];
+    return 0;
+}
+
+fn void ContinueStmt.print(const ContinueStmt* s, StringBuf* out, u32 indent) {
+    s.base.printKind(out, indent);
+    if (s.hasName()) out.print(" %s", ast.idx2name(s.name_idx[0]));
+    out.newline();
+}
+

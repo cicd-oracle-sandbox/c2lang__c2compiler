@@ -1,0 +1,269 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import string_buffer { StringBuf }
+
+public type TypeKind enum u8 (public const char* const name) {
+    Builtin   : { "Builtin" },
+    Pointer   : { "Pointer" },
+    Array     : { "Array" },
+    Struct    : { "Struct" },
+    Enum      : { "Enum" },
+    Function  : { "Function" },
+    Void      : { "Void" },
+    Alias     : { "Alias" },
+    Module    : { "Module" },
+}
+
+type TypeBits struct {
+    TypeKind kind : 8;
+    u32 align : 8;
+}
+static_assert(4, sizeof(TypeBits));
+const u32 NumTypeBits = 16;
+
+public type Type struct @(opaque) {
+    union {
+        TypeBits typeBits;
+        BuiltinTypeBits builtinTypeBits;
+        ArrayTypeBits arrayTypeBits;
+        u32 bits;
+    }
+    u32 ptr_pool_idx;            // index into PointerPool, 0 means no pointers
+    QualType canonicalType;
+}
+
+fn void Type.init(Type* t, TypeKind k) {
+    t.bits = 0;
+    t.typeBits.kind = k;
+    t.typeBits.align = 0;
+    t.ptr_pool_idx = 0;
+    t.canonicalType.ptr = 0;
+}
+
+public fn TypeKind Type.getKind(const Type* t) { return t.typeBits.kind; }
+
+/*
+public fn bool Type.hasCanonicalType(const Type* t) {
+    return t.canonicalType.ptr != 0;
+}
+*/
+
+fn QualType Type.getCanonicalType(const Type* t) { return t.canonicalType; }
+
+public fn void Type.setCanonicalType(Type* t, QualType canon) { t.canonicalType = canon; }
+
+fn u32 Type.getIndex(const Type* t) { return t.ptr_pool_idx; }
+
+fn bool Type.isBuiltinType(const Type* t) {
+    return (t.getKind() == Builtin);
+}
+
+public fn bool Type.isArrayType(const Type* t) {
+    return (t.getKind() == Array);
+}
+
+public fn bool Type.isStructType(const Type* t) {
+    return (t.getKind() == Struct);
+}
+
+public fn bool Type.isPointerType(const Type* t) {
+    return (t.getKind() == Pointer);
+}
+
+fn bool Type.isFunctionType(const Type* t) {
+    return (t.getKind() == Function);
+}
+
+fn bool Type.isEnumType(const Type* t) {
+    return (t.getKind() == Enum);
+}
+
+public fn bool Type.isVoidType(const Type* t) {
+    return (t.getKind() == Void);
+}
+
+public fn void Type.dump(const Type* t) @(unused) {
+    StringBuf* out = ast.getDumpBuf();
+    t.print(out);
+    out.newline();
+    ast.flushDumpBuf(out);
+}
+
+fn void Type.setAlignment(Type* t, u32 align) {
+    t.typeBits.align = align;
+}
+
+public fn u32 Type.getAlignment(const Type* t) {
+    switch (t.getKind()) {
+    case Builtin:
+    case Pointer:
+    case Function:
+        return t.typeBits.align;
+    case Array:
+        const ArrayType* at = (ArrayType*)t;
+        QualType elem = at.getElemType();
+        return elem.getAlignment();
+    case Struct:
+        const StructType* s = (StructType*)t;
+        const StructTypeDecl* std = s.getDecl();
+        return std.getAlignment();
+    case Enum:
+        const EnumType* e = (EnumType*)t;
+        const EnumTypeDecl* etd = e.getDecl();
+        QualType it = etd.getImplType();
+        return it.getTypeOrNil().getAlignment();
+    case Void:
+        return 0;
+    case Alias:
+        QualType canon = t.getCanonicalType();
+        return canon.getAlignment();
+    case Module:
+        // should not happen
+        return 0;
+    }
+    return 0;
+}
+
+fn u32 Type.getElemSize(const Type* t) {
+    switch (t.getKind()) {
+    case Pointer:
+        const PointerType* pt = (PointerType*)t;
+        QualType inner = pt.getInner();
+        return inner.getSize();
+    case Array:
+        const ArrayType* at = (ArrayType*)t;
+        QualType elem = at.getElemType();
+        return elem.getSize();
+    case Alias:
+        QualType canon = t.getCanonicalType();
+        return canon.getElemSize();
+    default:
+        return 1;
+    }
+}
+
+fn u32 Type.getSize(const Type* t) {
+    switch (t.getKind()) {
+    case Builtin:
+        const BuiltinType* bi = (BuiltinType*)t;
+        return bi.getAlignment();   // note: alignment is size
+    case Pointer:
+    case Function:
+        return t.getAlignment();
+    case Array:
+        const ArrayType* at = (ArrayType*)t;
+        QualType elem = at.getElemType();
+        return at.getSize() * elem.getSize();
+    case Struct:
+        const StructType* s = (StructType*)t;
+        const StructTypeDecl* std = s.getDecl();
+        return std.getSize();
+    case Enum:
+        const EnumType* e = (EnumType*)t;
+        const EnumTypeDecl* etd = e.getDecl();
+        QualType it = etd.getImplType();
+        return it.getSize();
+    case Void:
+        return 0;
+    case Alias:
+        QualType canon = t.getCanonicalType();
+        return canon.getSize();
+    case Module:
+        // should not happen
+        return 0;
+    }
+    return 0;
+}
+
+fn void Type.print(const Type* t, StringBuf* out) {
+    out.color(col_Type);
+    switch (t.getKind()) {
+    case Builtin:
+        BuiltinType.print((BuiltinType*)t, out);
+        break;
+    case Pointer:
+        PointerType.print((PointerType*)t, out);
+        break;
+    case Array:
+        ArrayType.print((ArrayType*)t, out);
+        break;
+    case Struct:
+        StructType.print((StructType*)t, out);
+        break;
+    case Enum:
+        EnumType.print((EnumType*)t, out);
+        break;
+    case Function:
+        FunctionType.print((FunctionType*)t, out);
+        break;
+    case Void:
+        VoidType.print((VoidType*)t, out);
+        break;
+    case Alias:
+        AliasType.print((AliasType*)t, out);
+        break;
+    case Module:
+        ModuleType.print((ModuleType*)t, out);
+        break;
+    }
+}
+
+fn void Type.fullPrint(const Type* t, StringBuf* out, u32 indent) {
+    switch (t.getKind()) {
+    case Builtin:
+        BuiltinType.fullPrint((BuiltinType*)t, out, indent);
+        break;
+    case Pointer:
+        PointerType.fullPrint((PointerType*)t, out, indent);
+        break;
+    case Array:
+        ArrayType.fullPrint((ArrayType*)t, out, indent);
+        break;
+    case Struct:
+        StructType.fullPrint((StructType*)t, out, indent);
+        break;
+    case Enum:
+        EnumType.fullPrint((EnumType*)t, out, indent);
+        break;
+    case Function:
+        FunctionType.fullPrint((FunctionType*)t, out, indent);
+        break;
+    case Void:
+        VoidType.fullPrint((VoidType*)t, out, indent);
+        break;
+    case Alias:
+        AliasType.fullPrint((AliasType*)t, out, indent);
+        break;
+    case Module:
+        ModuleType.fullPrint((ModuleType*)t, out, indent);
+        break;
+    }
+    out.indent(indent);
+    out.add("canonical=");
+    Type* canon = t.canonicalType.getTypeOrNil();
+    if (canon) {
+        if (canon == t) {
+            out.add("this\n");
+        } else {
+            canon.fullPrint(out, indent + 1);
+        }
+    } else {
+        out.add("NIL\n");
+    }
+}
+

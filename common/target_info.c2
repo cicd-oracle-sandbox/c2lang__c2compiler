@@ -1,0 +1,138 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module target_info;
+
+import stdio { snprintf }
+import string { strcasecmp }
+
+public type Arch enum u8 (const char* const name) {
+    Unknown  : { "unknown" },
+    I686     : { "i686" },
+    Arm      : { "arm" },
+    X86_64   : { "x86_64" },
+    Amd64    : { "amd64" },
+    Arm64    : { "arm64" },
+    Riscv_32 : { "riscv32" },
+    Riscv_64 : { "riscv64" },
+}
+
+public type System enum u8 (const char* const name) {
+    Unknown  : { "unknown" },
+    Linux    : { "linux" },
+    Darwin   : { "darwin" },
+    Cygwin   : { "cygwin" },
+    FreeBSD  : { "freebsd" },
+    OpenBSD  : { "openbsd" },
+}
+
+public type Vendor enum u8 (const char* const name) {
+    Unknown  : { "unknown" },
+    Apple    : { "apple" },
+}
+
+public type Abi enum u8 (const char* const name) {
+    Unknown  : { "unknown" },
+    GNU      : { "gnu" },
+    GNU_EABI : { "gnueabi" },
+    MACHO    : { "macho" },
+    WIN32    : { "win32" },
+    Rv32G    : { "rv32" },
+    BSD      : { "bsd" }
+}
+
+public fn System str2sys(const char* name) {
+    for (System i = System.min; i <= System.max; i++) {
+        if (strcasecmp(i.name, name) == 0) return i;
+    }
+    return Unknown;
+}
+
+public fn Arch str2arch(const char* name) {
+    for (Arch i = Arch.min; i <= Arch.max; i++) {
+        if (strcasecmp(i.name, name) == 0) return i;
+    }
+    return Unknown;
+}
+
+public fn Vendor str2vendor(const char* name) {
+    for (Vendor i = Vendor.min; i <= Vendor.max; i++) {
+        if (strcasecmp(i.name, name) == 0) return i;
+    }
+    return Unknown;
+}
+
+public fn Abi str2abi(const char* name) {
+    for (Abi i = Abi.min; i <= Abi.max; i++) {
+        if (strcasecmp(i.name, name) == 0) return i;
+    }
+    return Unknown;
+}
+
+public type TargetInfo struct {
+    Arch arch;
+    System sys;
+    Vendor vendor;
+    Abi abi;
+
+    u32 ptrWidth;   // 32/64
+    u32 longWidth;  // 32/64
+
+    char[80] triple;
+}
+
+public fn void TargetInfo.init(TargetInfo* info) {
+    switch (info.arch) {
+    case Unknown:
+        info.ptrWidth = 64;
+        info.longWidth = 64;
+        break;
+    case I686:
+    case Arm:
+        info.ptrWidth = 32;
+        info.longWidth = 32;
+        break;
+    case X86_64:
+    case Arm64:
+    case Amd64:
+        info.ptrWidth = 64;
+        info.longWidth = 64;
+        break;
+    case Riscv_32:
+        info.ptrWidth = 32;
+        info.longWidth = 32;
+        break;
+    case Riscv_64:
+        info.ptrWidth = 64;
+        info.longWidth = 64;
+        break;
+    }
+
+    snprintf(info.triple, countof(info.triple), "%s-%s-%s-%s",
+             info.arch.name, info.vendor.name, info.sys.name, info.abi.name);
+}
+
+public fn const char* TargetInfo.str(const TargetInfo* info) {
+    return info.triple;
+}
+
+public fn const char* TargetInfo.getSystemName(const TargetInfo* info) {
+    return info.sys.name;
+}
+
+public fn const char* TargetInfo.getArchName(const TargetInfo* info) {
+    return info.arch.name;
+}
+

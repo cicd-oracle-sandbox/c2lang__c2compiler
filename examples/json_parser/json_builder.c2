@@ -1,0 +1,120 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module json;
+
+import utils { StringBuffer }
+
+public type Builder struct {
+    StringBuffer buffer;
+    bool[6] hasEntry;
+    bool[6] inArray;
+    u32 indent;
+}
+
+public fn void Builder.init(Builder* b, u32 capacity) {
+    b.buffer.init(capacity);
+    b.reset();
+}
+
+public fn void Builder.free(Builder* b) {
+    b.buffer.deinit();
+}
+
+public fn void Builder.finalize(Builder* b) {
+    b.buffer.putc('\n');
+}
+
+public fn const char* Builder.getData(Builder* b) {
+    return b.buffer.data();
+}
+
+public fn u32 Builder.getSize(const Builder* b) {
+    return b.buffer.size() + 1;  // include 0-termination
+}
+
+public fn void Builder.addNumber(Builder* b, const char* key, i64 value) {
+    if (b.hasEntry[b.indent]) b.buffer.add(",\n");
+    b.buffer.indent(b.indent * 2);
+    if (b.inArray[b.indent]) {
+        b.buffer.printf("%d", value);
+    } else {
+        b.buffer.printf("\"%s\": %d", key, value);
+    }
+    b.hasEntry[b.indent] = true;
+}
+
+public fn void Builder.addValue(Builder* b, const char* key, const char* value) {
+    if (b.hasEntry[b.indent]) b.buffer.add(",\n");
+    b.buffer.indent(b.indent * 2);
+    if (b.inArray[b.indent]) {
+        b.buffer.printf("\"%s\"", value);
+    } else {
+        b.buffer.printf("\"%s\": \"%s\"", key, value);
+    }
+    b.hasEntry[b.indent] = true;
+}
+
+public fn void Builder.addObject(Builder* b, const char* key) {
+    if (b.hasEntry[b.indent]) b.buffer.add(",\n");
+    b.buffer.indent(b.indent * 2);
+    if (!b.inArray[b.indent]) {
+        b.buffer.printf("\"%s\":\n", key);
+        b.buffer.indent(b.indent * 2);
+    }
+    b.buffer.printf("{\n");
+    b.hasEntry[b.indent] = true;
+    b.indent++;
+    b.hasEntry[b.indent] = false;
+    b.inArray[b.indent] = false;
+}
+
+public fn void Builder.closeObject(Builder* b) {
+    // NOTE: no sanity check
+    b.indent--;
+    b.buffer.putc('\n');
+    b.buffer.indent(b.indent * 2);
+    b.buffer.putc('}');
+}
+
+public fn void Builder.addArray(Builder* b, const char* key) {
+    if (b.hasEntry[b.indent]) b.buffer.add(",\n");
+    b.buffer.indent(b.indent * 2);
+    if (key) {
+        b.buffer.printf("\"%s\":\n", key);
+        b.buffer.indent(b.indent * 2);
+    }
+    b.buffer.printf("[\n");
+    b.hasEntry[b.indent] = true;
+    b.indent++;
+    b.inArray[b.indent] = true;
+    b.hasEntry[b.indent] = false;
+}
+
+public fn void Builder.closeArray(Builder* b) {
+    b.inArray[b.indent] = false;
+    b.indent--;
+    b.buffer.putc('\n');
+    b.buffer.indent(b.indent * 2);
+    b.buffer.putc(']');
+}
+
+public fn void Builder.reset(Builder* b) {
+    b.buffer.clear();
+    for (u32 i = 0; i < countof(b.hasEntry); i++) b.hasEntry[i] = false;
+    for (u32 i = 0; i < countof(b.inArray); i++) b.inArray[i] = false;
+    b.indent = 0;
+}
+

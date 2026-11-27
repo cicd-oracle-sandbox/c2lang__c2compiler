@@ -1,0 +1,115 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2i_generator;
+
+import ast { * }
+import component { Component, ComponentList }
+import console;
+import file_buffer { FileBuffer }
+import file_utils { Pathname }
+import string_buffer { StringBuf }
+import string_list { StringList }
+import string_pool { StringPool }
+
+type Generator struct {
+    StringPool* astPool;
+    StringBuf* out;
+    const char* output_dir;
+    StringList imports;  // used to filter out duplicate imports (from different ASTs)
+    Module* mod;
+    const char* mod_name;
+    bool in_body;
+    u32 indent;
+}
+
+fn const char* Generator.idx2name(const Generator* gen, u32 name_idx) {
+    return gen.astPool.idx2str(name_idx);
+}
+
+public fn void generate(StringPool* astPool, const char* output_dir, ComponentList* comps)
+{
+    Generator gen = {}
+    gen.astPool = astPool;
+    gen.out = StringBuf.create(64*1024, false, 3);
+    gen.output_dir = output_dir;
+
+    Component* mainComp = comps.getLast();
+
+    // generate external components
+    for (u32 i=0; i<comps.size(); i++) {
+        Component* c = comps.get(i);
+        c.visitModules(Generator.on_module, &gen);
+    }
+    // generate main module
+    mainComp.visitModules(Generator.on_module, &gen);
+    gen.out.free();
+}
+
+fn void Generator.on_module(void* arg, Module* m) {
+    if (!m.isUsed() || !m.isExported()) return;
+
+    Generator* gen = arg;
+    gen.out.clear();
+    gen.mod = m;
+    gen.mod_name = m.getName();
+    gen.in_body = false;
+    gen.imports.init(nil);  // note: cannot get string values! (not needed)
+
+    // module
+    gen.out.print("module %s;\n\n", gen.mod_name);
+
+    // imports
+    m.visitImports(on_import, gen);
+    if (gen.imports.length()) gen.out.newline();
+
+    // public decls
+    m.visitDecls(on_decl, gen);
+
+    Pathname file.init(gen.output_dir, gen.mod_name, ".c2i");
+    FileBuffer fbuf.init(gen.out.data(), gen.out.size());
+    if (!fbuf.writeFile(file.path)) {
+        console.error("cannot write to %s: %s", file.path, fbuf.getError());
+    }
+    fbuf.deinit();
+    gen.imports.free();
+}
+
+fn void on_import(void* arg, ImportDecl* i) {
+    Generator* gen = arg;
+    Decl* d = (Decl*)i;
+
+    if (!d.isUsedPublic()) return;
+
+    // filter duplicate imports between different ASTs
+    u32 name_idx = d.getNameIdx();
+    if (gen.imports.contains_idx(name_idx)) return;
+    gen.imports.add(name_idx);
+
+    gen.out.print("import %s;\n", gen.idx2name(d.getNameIdx()));
+}
+
+fn void on_decl(void* arg, Decl* d) {
+    Generator* gen = arg;
+
+    if (!d.isPublic()) return;
+    if (d.isImport()) return;
+
+    gen.emitGlobalDecl(d);
+}
+
+fn void Generator.emitName(Generator* gen, StringBuf* out, const Decl* d) {
+    out.add(gen.idx2name(d.getNameIdx()));
+}

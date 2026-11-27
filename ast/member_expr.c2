@@ -1,0 +1,370 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc, SrcRange }
+import string_buffer { StringBuf }
+
+import string { memcpy, strlen }
+
+public type MemberConversion enum u8 {
+    None,
+    Addr,       // Foo -> Foo* (ie &f)
+    Deref,      // Foo* -> Foo (ie *f)
+}
+
+public type MemberKind enum u8 (const char* const name) {
+    Unresolved         : { "Unresolved" },
+    Module             : { "Module" },
+    StructMember       : { "StructMember" }, // struct-var.member
+    TypeFunc           : { "TypeFunc" },
+    StaticTypeFunc     : { "StaticTypeFunc" },
+    EnumConstant       : { "EnumConstant" },  // Enum.A
+    EnumAssocValue     : { "EnumAssocValue" },  // Enum.name
+    EnumConstantValue  : { "EnumConstantValue" },  // e.name
+}
+
+type MemberExprBits struct @(packed) {
+    u32 : NumExprBits;
+    MemberKind kind : 3;
+    u32 num_decls : 2;  // how many refs have a decl (from the bottom up), set during analysis
+    u32 has_expr : 1;
+    u32 base_qualifiers : 2;
+    MemberConversion conversion : 2;
+    u32 is_bitfield : 1;
+    u32 base_len : 5;
+}
+static_assert(4, sizeof(MemberExprBits));
+
+// 2 variants: pure: `a.b` and non pure: `<expr>.b`
+type MemberRef union {
+    u32 name_idx;
+    Decl* decl;     // set during analysis
+    Expr* expr;     // for first ref in non-pure mode
+    usize bits;
+}
+
+static_assert(8, sizeof(MemberRef));
+
+public type MemberExpr struct @(opaque) {
+    // base.loc points to the beginning of the member name in refs[1]
+    Expr base;
+    MemberRef[2] refs;
+}
+
+// if base == nil, MemberExpr is pure, otherwise non-pure
+public fn MemberExpr* MemberExpr.create(Context* c,
+                                        Expr* base,
+                                        u32 base_name_idx,
+                                        u32 base_len,
+                                        SrcLoc loc,
+                                        u32 member_name_idx) {
+    u32 size = sizeof(MemberExpr);
+    MemberExpr* e = c.alloc(size);
+    e.base.init(Member, loc, 0, 0, 0, NValue);
+    e.base.base.memberExprBits.base_len = base_len;
+    e.refs[0].bits = 0;
+    e.refs[0].name_idx = base_name_idx;
+    if (base) {
+        e.refs[0].expr = base;
+        e.base.base.memberExprBits.has_expr = 1;
+    }
+    e.refs[1].bits = 0;
+    e.refs[1].name_idx = member_name_idx;
+#if AstStatistics
+    Stats.addExpr(Member, size);
+#endif
+    return e;
+}
+
+fn Expr* MemberExpr.instantiate(MemberExpr* e, Instantiator* inst) {
+    u32 size = sizeof(MemberExpr);
+    MemberExpr* e2 = inst.c.alloc(size);
+
+    memcpy(e2, e, size);
+    if (e2.hasExpr()) e2.refs[0].expr = e2.refs[0].expr.instantiate(inst);
+
+#if AstStatistics
+    Stats.addExpr(Member, size);
+#endif
+    return (Expr*)e2;
+}
+
+public fn bool MemberExpr.hasExpr(const MemberExpr* e) {
+    return e.base.base.memberExprBits.has_expr;
+}
+
+public fn Expr* MemberExpr.getBaseExpr(const MemberExpr* e) {
+    if (e.hasExpr()) return e.refs[0].expr;
+    return nil;
+}
+
+public fn Expr** MemberExpr.getBaseExpr2(MemberExpr* e) {
+    if (e.hasExpr()) return &e.refs[0].expr;
+    return nil;
+}
+
+public fn void MemberExpr.setConversion(MemberExpr* e, MemberConversion c) {
+    e.base.base.memberExprBits.conversion = c;
+}
+
+public fn MemberConversion MemberExpr.getConversion(const MemberExpr* e) {
+    return e.base.base.memberExprBits.conversion;
+}
+
+fn const char* MemberExpr.getName(const MemberExpr* e, u32 ref_idx) {
+    if (u32 name_idx = e.getNameIdx(ref_idx)) return ast.idx2name(name_idx);
+    return nil;
+}
+
+public fn u32 MemberExpr.getNameIdx(const MemberExpr* e, u32 ref_idx) {
+    if (ref_idx == 0 && e.hasExpr()) {
+        Expr* base = e.getBaseExpr();
+        // Note: base can never be an Identifier (unless manually generated)
+        assert(!base.isIdentifier());
+        //if (base.isIdentifier()) return ((IdentifierExpr*)base).getNameIdx();
+        return 0;
+    }
+    const MemberRef* ref = &e.refs[ref_idx];
+    if (e.base.base.memberExprBits.num_decls > ref_idx) {
+        Decl* d = ref.decl;
+        if (d.isImport()) {
+            const ImportDecl* id = (ImportDecl*)d;
+            u32 alias_idx = id.getAliasNameIdx();
+            if (alias_idx) return alias_idx;
+        }
+        return d.getNameIdx();
+    }
+    return ref.name_idx;
+}
+
+public fn SrcLoc MemberExpr.getLoc(const MemberExpr* e, u32 ref_idx = 1) {
+    SrcLoc loc = e.base.getLoc();
+    if (ref_idx) return loc;
+    if (e.hasExpr()) return e.getBaseExpr().getLoc();
+    return loc - 1 - e.base.base.memberExprBits.base_len;
+}
+
+public fn SrcLoc MemberExpr.getMemberLoc(const MemberExpr* e) {
+    return e.base.getLoc();
+}
+
+fn SrcLoc MemberExpr.getStartLoc(const MemberExpr* e) {
+    if (e.hasExpr()) return e.refs[0].expr.getStartLoc();
+    return e.base.getLoc() - 1 - e.base.base.memberExprBits.base_len;
+}
+
+fn SrcLoc MemberExpr.getEndLoc(const MemberExpr* e) {
+    return e.base.getLoc() + (u32)strlen(e.getName(1));
+}
+
+fn SrcLoc MemberExpr.getBaseEndLoc(const MemberExpr* e) {
+    if (e.hasExpr()) return e.getBaseExpr().getEndLoc();
+    return e.base.getLoc() - 1;
+}
+
+public fn SrcRange MemberExpr.getBaseRange(const MemberExpr* e) {
+    return { e.getStartLoc(), e.getBaseEndLoc() }
+}
+
+public fn Ref MemberExpr.getBaseRef(const MemberExpr* e) {
+    Ref ref;
+    ref.loc = e.getStartLoc();
+    ref.name_idx = e.getNameIdx(0);
+    ref.decl = e.getDecl(0);
+    return ref;
+}
+
+public fn Ref MemberExpr.getRef(const MemberExpr* e) {
+    Ref ref;
+    ref.loc = e.getLoc(1);
+    ref.name_idx = e.getNameIdx(1);
+    ref.decl = e.getDecl(1);
+    return ref;
+}
+
+public fn MemberKind MemberExpr.getKind(const MemberExpr* e) {
+    return e.base.base.memberExprBits.kind;
+}
+
+public fn IdentifierKind MemberExpr.getIdentifierKind(const MemberExpr* e) {
+    switch (e.getKind()) {
+    case Unresolved:     return Unresolved;
+    case Module:         break;
+    case StructMember:   return StructMember;
+    case TypeFunc:       return Function;
+    case StaticTypeFunc: return Function;
+    case EnumConstant:   return EnumConstant;
+    case EnumAssocValue:
+    case EnumConstantValue: return Var;
+    }
+
+    Decl* d = e.getFullDecl();
+    switch (d.getKind()) {
+    case Function:      return Function;
+    case Import:        break;
+    case StructType:    return Type;
+    case EnumType:      return Type;
+    case EnumConstant:  return EnumConstant;
+    case FunctionType:  return Type;
+    case AliasType:     return Type;
+    case Variable:      return Var;
+    }
+
+    return Unresolved;
+}
+
+public fn void MemberExpr.setKind(MemberExpr* e, MemberKind kind) {
+    e.base.base.memberExprBits.kind = kind;
+}
+
+fn bool MemberExpr.isTypeFunc(const MemberExpr* e) {
+    return e.getKind() == TypeFunc;
+}
+
+public fn void MemberExpr.setBitfield(MemberExpr* e) {
+    e.base.base.memberExprBits.is_bitfield = 1;
+}
+
+fn bool MemberExpr.isBitfield(const MemberExpr* e) {
+    return e.base.base.memberExprBits.is_bitfield;
+}
+
+public fn bool MemberExpr.isStaticTypeFunc(const MemberExpr* e) {
+    return e.getKind() == StaticTypeFunc;
+}
+
+public fn void MemberExpr.setBaseQuals(MemberExpr* e, u32 qualifiers) {
+    e.base.base.memberExprBits.base_qualifiers = qualifiers;
+}
+
+fn u32 MemberExpr.getBaseQuals(const MemberExpr* e) {
+    return e.base.base.memberExprBits.base_qualifiers;
+}
+
+// returns the final base decl (eg: a.b <- returns a). Must be fully analysed
+public fn Decl* MemberExpr.getBaseDecl(const MemberExpr* e) {
+    if (e.hasExpr()) {
+        Expr* base = e.getBaseExpr();
+        if (base.isIdentifier()) return ((IdentifierExpr*)base).getDecl();
+        if (base.isMember()) return ((MemberExpr*)base).getFullDecl();
+        return nil;
+    }
+    if (e.base.base.memberExprBits.num_decls < 1) return nil;
+    return e.refs[0].decl;
+}
+
+// returns the final decl. must be fully analysed
+public fn Decl* MemberExpr.getFullDecl(const MemberExpr* e) {
+    if (e.base.base.memberExprBits.num_decls < 2) return nil;
+    return e.refs[1].decl;
+}
+
+public fn Decl* MemberExpr.getDecl(const MemberExpr* e, u32 ref_idx) {
+    if (e.base.base.memberExprBits.num_decls <= ref_idx) return nil;
+    return e.refs[ref_idx].decl;
+}
+
+public fn void MemberExpr.setDecl(MemberExpr* e, Decl* d, u32 ref_idx) {
+    e.base.base.memberExprBits.num_decls = ref_idx + 1;
+    e.refs[ref_idx].decl = d;
+}
+
+public fn QualType MemberExpr.getBaseType(const MemberExpr* m) {
+    if (m.hasExpr()) return m.refs[0].expr.getType();
+    QualType qt = m.refs[0].decl.getType();
+    qt.setQuals(m.getBaseQuals());
+    return qt;
+}
+
+public fn const char* MemberExpr.getMemberName(const MemberExpr* e) {
+    return e.getName(1);
+}
+
+fn void MemberExpr.print(const MemberExpr* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.space();
+    MemberKind kind = e.getKind();
+    if (kind == Unresolved) out.color(col_Error);
+    else out.color(col_Attr);
+    out.add(kind.name);
+    out.color(col_Attr);
+    if (e.isBitfield()) out.add(" bitfield");
+    if (e.isTypeFunc()) out.add(" TF");
+    if (e.isStaticTypeFunc()) out.add(" STF");
+    if (e.getBaseQuals() & QualType_Const) out.add(" const-base");
+    if (e.getBaseQuals() & QualType_Volatile) out.add(" volatile-base");
+    switch (e.getConversion()) {
+    case None:
+        break;
+    case Addr:
+        out.add(" Addr");
+        break;
+    case Deref:
+        out.add(" Deref");
+        break;
+    }
+    out.print(" refs=%d/2 ", e.base.base.memberExprBits.num_decls);
+    out.color(col_Value);
+    e.printLiteral(out);
+    out.newline();
+    if (e.hasExpr()) e.refs[0].expr.print(out, indent + 1);
+}
+
+fn void MemberExpr.printLiteral(const MemberExpr* e, StringBuf* out) {
+    if (e.hasExpr()) {
+        e.refs[0].expr.printLiteral(out);
+    } else {
+        out.add(e.getName(0));
+    }
+    out.add1('.');
+    out.add(e.getName(1));
+}
+
+public fn void MemberExpr.dump(const MemberExpr* m) @(unused) {
+    StringBuf* out = ast.getDumpBuf();
+    out.color(col_Expr);
+    out.print("MemberExpr loc %d expr %d decl %d/2\n",
+              m.base.getLoc(), m.hasExpr(), m.base.base.memberExprBits.num_decls);
+    const MemberExprBits* bits = &m.base.base.memberExprBits;
+    MemberKind k = bits.kind;
+    out.print("  bits: kind %s, conv %d, bitf %d\n",
+              k.name, bits.conversion, bits.is_bitfield);
+    u32 start = 0;
+    if (m.hasExpr()) {
+        out.indent(1);
+        out.color(col_Value);
+        out.add("<expr>\n");
+        Expr* e = m.getBaseExpr();
+        e.print(out, 1);
+        start = 1;
+    }
+    for (u32 i = start; i < 2; i++) {
+        const MemberRef* ref = &m.refs[i];
+        out.indent(1);
+        out.color(col_Expr);
+        if (m.base.base.memberExprBits.num_decls > i) {
+            out.print("[%d]\n", i);
+            ref.decl.print(out, 1);
+        } else {
+            out.print("[%d] %s\n", i, ast.idx2name(ref.name_idx));
+        }
+    }
+    ast.flushDumpBuf(out);
+}
+

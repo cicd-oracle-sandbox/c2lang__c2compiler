@@ -1,0 +1,65 @@
+// @recipe bin
+    $warnings no-unused
+    $backend c no-build
+
+// @file{file1}
+module test;
+
+type Handle i32;
+
+type Foo struct {
+  i32 a;
+  i64 b;
+  union {
+     i32 c;
+     f64 d;
+  }
+}
+
+u8[10] aa;
+u16[10] bb;
+u32[10] cc;
+
+public fn i32 main(i32 argc, const char** argv) {
+    i32 a = sizeof(i32*);
+    i32 b = sizeof(a);
+    //i32 c = sizeof(&a);
+    i32 d = sizeof(Handle);
+    i32 e = sizeof(Handle*);
+    //i32 f = sizeof(Handle[3]);
+    i32 g = sizeof(Foo);
+    i32 h = sizeof(Foo.a);
+    i32 i = sizeof(Foo.d);
+    i32 j = sizeof(test.Foo);
+    i32 k = sizeof(test.Foo.a);
+    i32 l = sizeof(test.Foo.d);
+    i32 o1 = sizeof(aa);
+    i32 o2 = sizeof(bb);
+    i32 o3 = sizeof(cc);
+    return 0;
+}
+
+
+// @expect{atleast, cgen/build.c}
+
+int main(int argc, const char** argv)
+{
+    int a = 8;
+    int b = 4;
+    //int c = 8;
+    int d = 4;
+    int e = 8;
+    //int f = 12;
+    int g = 24;
+    int h = 4;
+    int i = 8;
+    int j = 24;
+    int k = 4;
+    int l = 8;
+    int o1 = 10;
+    int o2 = 20;
+    int o3 = 40;
+
+    return 0;
+}
+

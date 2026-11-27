@@ -1,0 +1,146 @@
+module stdlib extern "C";
+
+#if __ASAN__ || __MSAN__ || __UBSAN__
+import string { memset }
+#endif
+
+struct div_t {
+    int quot;
+    int rem;
+}
+
+struct ldiv_t {
+    long quot;
+    long rem;
+}
+type Ldiv_t ldiv_t;
+type Div_t div_t;
+
+const int RAND_MAX = 2147483647;      // same as Int32_max
+
+const i8 EXIT_FAILURE = 1;
+const i8 EXIT_SUCCESS = 0;
+
+void* calloc(size_t count, size_t size);
+#if __ASAN__ || __MSAN__ || __UBSAN__
+void* malloc(size_t size) {
+    // fill malloced blocks with junk if debugging
+    void* p = calloc(size, 1);
+    return p ? memset(p, 0xAA, size) : p;
+}
+#else
+void* malloc(size_t size);
+#endif
+void* realloc(void* ptr, size_t size);
+//fn void* reallocf(void* ptr, size_t size);
+void* valloc(size_t size);
+void free(void* ptr);
+
+double atof(const char* nptr);
+int atoi(const char* nptr);
+long atol(const char* nptr);
+long long atoll(const char* nptr);
+
+double strtod(const char* nptr, char** endptr);
+float strtof(const char* nptr, char** endptr);
+// NOTE returns long double (16 bytes, bah!)
+//fn long double strtold(const char* nptr, char** endptr);
+long strtol(const char* nptr, char** endptr, int base);
+unsigned long strtoul(const char* nptr, char** endptr, int base);
+long long strtoq(const char* nptr, char** endptr, int base);
+unsigned long long strtouq(const char* nptr, char** endptr, int base);
+long long strtoll(const char* nptr, char** endptr, int base);
+unsigned long long strtoull(const char* nptr, char** endptr, int base);
+
+char* l64a(long n);
+long a64l(const char* s);
+
+long random(void);
+void srandom(unsigned int seed);
+char* initstate(unsigned int seed, char* statebuf, size_t statelen);
+char* setstate(char* statebuf);
+
+struct Random_data @(opaque, cname="random_data");
+
+int random_r(Random_data* buf, int* result);
+int srandom_r(unsigned int seed, Random_data* buf);
+int initstate_r(unsigned int seed, char* statebuf, size_t statelen, Random_data* buf);
+int setstate_r(char* statebuf, Random_data* buf);
+int rand(void);
+void srand(unsigned int seed);
+int rand_r(unsigned int* seed);
+double drand48(void);
+double erand48(u16* xsubi);
+long lrand48(void);
+long nrand48(u16* xsubi);
+long mrand48(void);
+long jrand48(u16* xsubi);
+void srand48(long seedval);
+u16* seed48(u16* seed16v);
+void lcong48(u16* param);
+
+struct Drand48_data @(opaque, cname="drand48_data");
+
+int drand48_r(Drand48_data* buffer, double* result);
+int erand48_r(u16* xsubi, Drand48_data* buffer, double* result);
+int lrand48_r(Drand48_data* buffer, long* result);
+int nrand48_r(u16* xsubi, Drand48_data* buffer, long* result);
+int mrand48_r(Drand48_data* buffer, long* result);
+int jrand48_r(u16* xsubi, Drand48_data* buffer, long* result);
+int srand48_r(long seedval, Drand48_data* buffer);
+int seed48_r(u16* seed16v, Drand48_data* buffer);
+int lcong48_r(u16* param, Drand48_data* buffer);
+
+int posix_memalign(void** memptr, size_t alignment, size_t size);
+void* aligned_alloc(int alignment, size_t size);
+
+void abort(void) @(noreturn);
+int atexit(fn void());
+int at_quick_exit(fn void());
+int on_exit(fn void(i32, void*), void*);
+void exit(int status) @(noreturn);
+void quick_exit(int status);
+void _Exit(int status) @(noreturn);
+
+char* getenv(const char* name);
+int putenv(char* string);
+int setenv(const char* name, const char* value, int replace);
+int unsetenv(const char* name);
+int clearenv(void);
+
+int mkstemp(char* tpl);
+int mkstemps(char* tpl, int suffixlen);
+char* mkdtemp(char* tpl);
+int system(const char* command);
+char* realpath(const char* name, char* resolved);
+char* mktemp(char* tpl);
+
+void* bsearch(const void* key, const void* base, size_t nmemb, size_t size, fn i32(const void*, const void*) compare);
+void qsort(void* base, size_t nmemb, size_t size, fn i32(const void*, const void*) compar);
+
+int abs(int x) @(pure);
+long labs(long x) @(pure);
+div_t div(int numer, int denom);
+ldiv_t ldiv(long numer, long denom);
+
+char* ecvt(double value, int ndigit, int* decpt, int* sign);
+char* fcvt(double value, int ndigit, int* decpt, int* sign);
+char* gcvt(double value, int ndigit, char* buf);
+char* qecvt(double value, int ndigit, int* decpt, int* sign);
+char* qfcvt(double value, int ndigit, int* decpt, int* sign);
+char* qgcvt(double value, int ndigit, char* buf);
+int ecvt_r(double value, int ndigit, int* decpt, int* sign, char* buf, size_t len);
+int fcvt_r(double value, int ndigit, int* decpt, int* sign, char* buf, size_t len);
+int qecvt_r(double value, int ndigit, int* decpt, int* sign, char* buf, size_t len);
+int qfcvt_r(double value, int ndigit, int* decpt, int* sign, char* buf, size_t len);
+
+int mblen(const char* s, size_t n);
+int mbtowc(int* pwc, const char* s, size_t n);
+// needs wchar_t
+//int wctomb(char* s, int wchar);
+int mbstowcs(int* pwcs, const char* s, size_t n);
+int wcstombs(char* s, const int* pwcs, size_t n);
+int rpmatch(const char* response);
+int getsubopt(char** optionp, char* const* tokens, char** valuep);
+int getloadavg(double* loadavg, int nelem);
+

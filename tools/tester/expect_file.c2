@@ -1,0 +1,165 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module expect_file;
+
+import stdio { fprintf, stderr }
+import stdlib { calloc, free, exit, EXIT_FAILURE }
+import string { strncmp }
+
+import file_buffer { FileBuffer }
+import file_utils { Pathname }
+import line_db { LineDb }
+import string_buffer { StringBuf }
+import test_utils { * }
+
+/*
+    Design:
+    - compares file content with expectations
+    - start/end whitespace is always ingored
+    - empty lines test file are ignored
+    - can be in mode complete -> every line must match
+    - can be in mode atleast -> at least given lines must be present
+    - if lines are sequential, they must also be sequential in test file
+
+    Q: must there be space between 2 blocks in test file? -> no
+*/
+
+public type ExpectMode enum u8 {
+    ATLEAST,
+    COMPLETE,
+}
+
+public type ExpectFile struct @(opaque) {
+    Pathname filename;
+    ExpectMode mode;
+    StringBuf* output;  // will be set in check()
+
+    // during analysis
+    u32 lastLineNr;
+    u32 expIndex;
+
+    // TODO should inline the Db
+    LineDb* lines;
+}
+
+
+public fn ExpectFile* ExpectFile.create(const char* name, ExpectMode m) {
+    ExpectFile* f = calloc(1, sizeof(ExpectFile));
+    f.filename.init(name);
+    f.mode = m;
+    f.lines = LineDb.create();
+    return f;
+}
+
+public fn void ExpectFile.destroy(ExpectFile* f) {
+    f.lines.destroy();
+    free(f);
+}
+
+public fn void ExpectFile.addLine(ExpectFile* f, u32 line_nr, const char* start, const char* end) {
+    bool consecutive = (f.lastLineNr + 1 == line_nr); // ignore for first one (always ok)
+
+    start = skipBlanks(start);
+    end = trimTrailingBlanks(start, end);
+
+    if (start == end) return;   // ignore empty lines
+    if (strstart(start, "//")) return;   // ignore comments
+
+    f.lastLineNr = line_nr;
+    f.lines.add(start, end, consecutive);
+}
+
+fn bool ExpectFile.checkLine(ExpectFile* f, u32 line_nr, const char* start, const char* end) {
+
+    start = skipBlanks(start);
+    end = trimTrailingBlanks(start, end);
+
+    u32 len = (u32)(end - start);
+    if (len == 0) return true;  // ignore empty lines
+    if (strstart(start, "//")) return true;   // ignore comments
+
+#if TesterDebug
+    printf("got %d [%.*s]\n", line_nr, (i32)len, start);
+#endif
+
+    if (f.expIndex >= f.lines.size()) {
+        if (f.mode == COMPLETE) {
+            color_print2(f.output, colError, "%s:%d: unexpected line '%.*s'",
+                         f.filename.path, line_nr, (i32)len, start);
+            return false;
+        } else {
+            return true;
+        }
+    }
+    const char* expectedLine = f.lines.getLine(f.expIndex);
+    bool consecutive = f.lines.getConsecutive(f.expIndex);
+
+    if (strncmp(expectedLine, start, len) == 0) {
+#if TesterDebug
+        printf("-> match\n");
+#endif
+        f.expIndex++;
+        return true;
+    }
+    if (f.mode == COMPLETE || consecutive) {
+        color_print2(f.output, colError, "%s:%d: expected '%s'\n       got '%.*s'",
+                     f.filename.path, line_nr, expectedLine, (i32)len, start);
+        return false;
+    }
+    return true;
+}
+
+public fn bool ExpectFile.check(ExpectFile* f, StringBuf* output, const char* basedir) {
+    Pathname file.init(basedir, f.filename.path);
+    if (!file.exists()) {
+        color_print2(output, colError, "  missing expected file '%s' (%s)", f.filename.path, file.path);
+        return false;
+    }
+
+    FileBuffer fbuf.init();
+    if (!fbuf.loadFile(file.path)) {
+        fprintf(stderr, "error loading %s: %s\n", file.path, fbuf.getError());
+        exit(EXIT_FAILURE);
+    }
+
+    f.output = output;
+    f.expIndex = 0;
+    bool result = true;
+
+    u32 line_nr = 1;
+    const char* lineStart = fbuf.data();
+    while (*lineStart) {
+        // cut it up into lines (even if empty)
+        const char* cp = lineEnd(lineStart);
+        if (!f.checkLine(line_nr, lineStart, cp)) {
+            result = false;
+            break;
+        }
+        line_nr++;
+        if (*cp) cp++;   // skip newline
+        lineStart = cp;
+    }
+
+    if (result && f.expIndex < f.lines.size()) {
+        const char* expectedLine = f.lines.getLine(f.expIndex);
+        color_print2(f.output, colError, "  in file %s: expected '%s'", f.filename.path, expectedLine);
+        result = false;
+    }
+
+    fbuf.deinit();
+    return result;
+}
+

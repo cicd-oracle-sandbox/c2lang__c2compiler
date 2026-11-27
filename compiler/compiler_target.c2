@@ -1,0 +1,104 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module compiler;
+
+import console;
+import sys_utsname;
+import target_info { TargetInfo, str2sys, str2arch, str2vendor, str2abi }
+
+import c_errno { errno }
+import stdio { sscanf }
+import stdlib { exit, EXIT_FAILURE }
+import string { strerror }
+
+fn void getNativeTarget(TargetInfo* info) {
+    sys_utsname.Name un;
+    if (sys_utsname.uname(&un) != 0) {
+        console.error("error getting system info: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    info.sys = str2sys(un.sysname);
+    switch (info.sys) {
+    case Unknown:
+        console.error("unsupported system: '%s'", un.sysname);
+        exit(EXIT_FAILURE);
+        break;
+    case Linux:
+        info.vendor = Unknown;  // hardcoded
+        info.abi = GNU;         // hardcoded
+        break;
+    case Darwin:
+        info.vendor = Apple;    // hardcoded
+        info.abi = MACHO;       // hardcoded
+        break;
+    case Cygwin:
+        info.vendor = Unknown;
+        info.abi = WIN32;
+        break;
+    case FreeBSD:
+        info.vendor = Unknown;
+        info.abi = BSD;
+        break;
+    case OpenBSD:
+        info.vendor = Unknown;
+        info.abi = BSD;
+        break;
+    }
+
+    info.arch = str2arch(un.machine);
+    if (info.arch == Unknown) {
+        console.error("unsupported arch: '%s'", un.machine);
+        exit(EXIT_FAILURE);
+    }
+
+    info.init();
+}
+
+fn bool fromString(TargetInfo* info, const char* triple) {
+    // expect format: <arch><sub>-<vendor>-<sys>-<abi>
+    // TODO support sub for ARM
+    char[32] arch_str;
+    char[32] vendor_str;
+    char[32] sys_str;
+    char[32] abi_str;
+    u32 pos = 0;
+
+    // split the triple string into 4 components
+    if (sscanf(triple, "%31[^-]-%31[^-]-%31[^-]-%31[^-]%n",
+               arch_str, vendor_str, sys_str, abi_str, &pos) != 4
+    ||  triple[pos] != '\0')
+        return false;
+
+    info.arch = str2arch(arch_str);
+    if (info.arch == Unknown) {
+        console.error("unsupported arch: %s", arch_str);
+        return false;
+    }
+    info.vendor = str2vendor(vendor_str);
+    info.sys = str2sys(sys_str);
+    if (info.sys == Unknown) {
+        //fprintf(stderr, "unknown vendor: %s\n", sys_str);
+    }
+    info.abi = str2abi(abi_str);
+    if (info.abi == Unknown) {
+        console.error("unsupported ABI: %s", abi_str);
+        return false;
+    }
+    info.init();
+    return true;
+}
+

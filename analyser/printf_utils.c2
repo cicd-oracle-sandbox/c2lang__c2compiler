@@ -1,0 +1,231 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module printf_utils;
+
+import ctype { isdigit }
+
+public type PrintfSpecifier enum u8 {
+    Invalid,        // unknown or length prefix
+    String,         // %s, %-s, %4s
+    Char,           // %c
+    Integer,        // %i, %-i, %-8i, %08i, %x, %o
+    FloatingPoint,  // %f
+    Pointer,        // %p
+    Offset,         // %n
+    Percent,        // %%
+}
+
+public type PrintfConversion struct {
+    char c;
+    u8 nflags;
+    bool has_width : 1;
+    bool has_width_star : 1;
+    bool has_prec : 1;
+    bool has_prec_star : 1;
+    u32 len;
+    i32 width;
+    i32 prec;
+}
+
+// cp points after first %, len is # of characters between % and conversion specifier (so '%d' -> len 0)
+fn PrintfSpecifier getPrintfSpecifier(const char* format, PrintfConversion* conv) {
+    const char* cp = format;
+
+    *conv = { .width = -1, .prec = -1 }
+
+    for (;;) {
+        /* skip optional flags */
+        switch (*cp) {
+        case ' ':
+        case '+':
+        case '-':
+        case '#':
+        case '\'':  // non-standard extension
+        case '0':
+            conv.nflags++;
+            cp++;
+            continue;
+        }
+        break;
+    }
+    if (*cp == '*') {
+        conv.has_width = true;
+        conv.has_width_star = true;
+        cp++;
+    } else
+    if (isdigit(*cp)) {
+        conv.has_width = true;
+        conv.width = *cp++ - '0';
+        while (isdigit(*cp)) {
+            conv.width = conv.width * 10 + *cp++ - '0';
+        }
+    }
+    if (*cp == '.') {
+        conv.has_prec = true;
+        cp++;
+        if (*cp == '*') {
+            conv.has_prec_star = true;
+            cp++;
+        } else
+        if (isdigit(*cp)) {
+            conv.prec = *cp++ - '0';
+            while (isdigit(*cp)) {
+                conv.prec = conv.prec * 10 + *cp++ - '0';
+            }
+        }
+    }
+    conv.len = (u32)(cp - format);
+    switch (conv.c = *cp) {
+    case '%':
+        // only if it is first char
+        if (cp == format) return Percent;
+        return Invalid;
+    case 'c':
+        return Char;
+    case 'a':
+    case 'e':
+    case 'f':
+    case 'g':
+    case 'A':
+    case 'E':
+    case 'F':
+    case 'G':
+        return FloatingPoint;
+    case 'p':
+        return Pointer;
+    case 's':
+        return String;
+    case 'b':
+    case 'B':
+    case 'd':
+    case 'o':
+    case 'x':
+    case 'X':
+        return Integer;
+    case 'n':
+        return Offset;
+    }
+    return Invalid;
+}
+
+public type PrintfFormatHandler fn bool (void* arg, u32 offset, PrintfSpecifier specifier, PrintfConversion* conv);
+
+public fn bool parsePrintfFormat(const char* format, PrintfFormatHandler handler, void* arg) {
+    const char* cp = format;
+    while (*cp) {
+        if (*cp++ == '%') {
+            u32 offset = (u32)(cp - format);
+            PrintfConversion conv;
+            PrintfSpecifier s = getPrintfSpecifier(cp, &conv);
+            cp += conv.len;
+            if (*cp) cp++;
+            if (!handler(arg, offset, s, &conv)) return false;
+        }
+    }
+    return true;
+}
+
+public type ScanfSpecifier enum u8 {
+    Invalid,        // unknown or length prefix
+    String,         // %s, %-s, %4s
+    Char,           // %c
+    Integer,        // %i, %-i, %-8i, %08i, %x, %o
+    FloatingPoint,  // %f
+    Pointer,        // %p
+    Scanset,        // %[   only scanf
+    Offset,         // %n
+    Percent,        // %%
+}
+
+public type ScanfConversion struct {
+    char c;
+    bool has_star;
+    bool has_width;
+    u32 len;        // characters between % and the conversion specifier
+    i32 width;      // specified width
+    u32 len2;       // extra characters for Scanset conversion
+}
+
+public type ScanfFormatHandler fn bool (void* arg, u32 offset, ScanfSpecifier specifier, ScanfConversion* conv);
+
+// format points after first %
+fn ScanfSpecifier getScanfSpecifier(const char* format, ScanfConversion* conv) {
+    const char* cp = format;
+    *conv = { .width = -1 }
+
+    if (*cp == '*') {
+        conv.has_star = true;
+        cp++;
+    }
+    if (isdigit(*cp)) {
+        conv.has_width = true;
+        conv.width = *cp++ - '0';
+        while (isdigit(*cp)) {
+            conv.width = conv.width * 10 + *cp++ - '0';
+        }
+    }
+    conv.len = (u32)(cp - format);
+    switch (conv.c = *cp) {
+    case '%':
+        if (cp == format) return Percent;
+        return Invalid;
+    case 'b':
+    case 'd':
+    case 'i':
+    case 'o':
+    case 'u':
+    case 'x':
+        return Integer;
+    case 'a':
+    case 'e':
+    case 'f':
+    case 'g':
+        return FloatingPoint;
+    case 'c':
+        return Char;
+    case 's':
+        return String;
+    case '[':
+        u32 pos = 1;
+        if (cp[pos] == '^') pos++;
+        if (cp[pos] == ']') pos++;
+        while (cp[pos] && cp[pos++] != ']') continue;
+        conv.len2 = pos - 1;
+        return Scanset;
+    case 'p':
+        return Pointer;
+    case 'n':
+        return Offset;
+    }
+    return Invalid;
+}
+
+public fn bool parseScanfFormat(const char* format, ScanfFormatHandler handler, void* arg) {
+    const char* cp = format;
+    while (*cp) {
+        if (*cp++ == '%') {
+            u32 offset = (u32)(cp - format);
+            ScanfConversion conv;
+            ScanfSpecifier s = getScanfSpecifier(cp, &conv);
+            cp += conv.len;
+            if (*cp) cp++;
+            cp += conv.len2;
+            if (!handler(arg, offset, s, &conv)) return false;
+        }
+    }
+    return true;
+}
+

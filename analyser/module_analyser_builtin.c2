@@ -1,0 +1,302 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module module_analyser;
+
+import ast { * }
+import size_analyser;
+import src_loc { SrcLoc }
+import value_type { Value }
+
+fn QualType Analyser.analyseBuiltin(Analyser* ma, Expr** e_ptr) {
+    Expr* e = *e_ptr;
+    BuiltinExpr* b = (BuiltinExpr*)e;
+
+    switch (b.getKind()) {
+    case Sizeof:
+        return ma.analyseSizeof(b);
+    case Countof:
+        return ma.analyseCountof(b);
+    case OffsetOf:
+        return ma.analyseOffsetOf(b);
+    case ToContainer:
+        return ma.analyseToContainer(b);
+    case VaArg:
+        return ma.analyseVaArg(b);
+    }
+
+    return QualType_Invalid;
+}
+
+fn QualType Analyser.analyseSizeof(Analyser* ma, BuiltinExpr* b) {
+    Expr* e = (Expr*)b;
+    Expr* inner = b.getInner();
+    assert(inner);
+
+    bool savedPublic = ma.usedPublic;
+    ma.usedPublic = false;
+    QualType qt;
+    if (inner.isType()) {
+        TypeExpr* te = (TypeExpr*)inner;
+        TypeRef* ref = te.getTypeRef();
+        qt = ma.analyseTypeRef(ref, true);
+        inner.setType(qt);
+    } else {
+        // is Identifier/memberExpr, could still be Type!
+
+        qt = ma.analyseExpr(&inner, false, 0); // dont set side
+        if (qt.isInvalid()) return QualType_Invalid;
+
+        // TODO extract to function
+        if (qt.isArray()) {
+            const ArrayType* at = qt.getArrayTypeOrNil();
+            if (at && !at.hasSize()) {
+                ma.error(inner.getLoc(), "sizeof cannot be used on arrays of unknown length");
+                return QualType_Invalid;
+            }
+        }
+        if (qt.isStruct()) {
+            StructType* st = qt.getStructType();
+            const StructTypeDecl* std = st.getDecl();
+            if (std.isOpaque()) {
+                const Decl* d = (Decl*)std;
+                bool is_external = ma.mod != d.getModule();
+                if (ma.curFunction && ma.curFunction.getInstanceModule() == d.getModule()) {
+                    // type is local in instantiation module
+                    is_external = false;
+                }
+                if (is_external) {
+                    ma.error(inner.getLoc(), "opaque type '%s' used by value", qt.diagName());
+                }
+            }
+        }
+    }
+    ma.usedPublic = savedPublic;
+    if (qt.isInvalid()) return QualType_Invalid;
+
+    size_analyser.TypeSize info = size_analyser.sizeOfType(qt);
+    b.setValue(info.size);
+    qt = getBuiltinQT(UInt32);
+    e.setType(qt);
+    return qt;
+}
+
+fn QualType Analyser.analyseCountof(Analyser* ma, BuiltinExpr* b) {
+    // could be EnumType or array VarDecl
+    Expr* e = (Expr*)b;
+    Expr* inner = b.getInner();
+    bool savedPublic = ma.usedPublic;
+    ma.usedPublic = false;
+    QualType qt = ma.analyseExpr(&inner, false, RHS);
+    ma.usedPublic = savedPublic;
+    if (qt.isInvalid()) return qt;
+
+    const ArrayType* at = qt.getArrayTypeOrNil();
+    if (at) {
+        if (!at.hasSize()) {
+            ma.error(inner.getLoc(), "countof cannot be used on arrays of unknown length");
+            return QualType_Invalid;
+        }
+        b.setValue(at.getSize());
+        qt = getBuiltinQT(UInt32);
+        e.setType(qt);
+        return qt;
+    }
+    const EnumType* et = qt.getEnumTypeOrNil();
+    if (et) {
+        const EnumTypeDecl* etd = et.getDecl();
+        b.setValue(etd.getNumConstants());
+        qt = getBuiltinQT(UInt32);
+        e.setType(qt);
+        return qt;
+    }
+    ma.error(inner.getLoc(), "countof can only be used on arrays/enums");
+    return QualType_Invalid;
+}
+
+fn QualType Analyser.analyseOffsetOf(Analyser* ma, BuiltinExpr* b) {
+    Expr* e = (Expr*)b;
+    Expr* inner = b.getInner();
+    QualType qt = ma.analyseExpr(&inner, false, RHS);
+    if (qt.isInvalid()) return QualType_Invalid;
+
+    StructType* st = qt.getStructTypeOrNil();
+    if (!st) {
+        ma.error(inner.getLoc(), "offsetof can only be used on struct types");
+        return QualType_Invalid;
+    }
+
+    StructTypeDecl* std = st.getDecl();
+    if (!ma.checkOpaque(std, inner.getLoc())) return QualType_Invalid;
+
+    Expr* member = b.getOffsetOfMember();
+    u32 offset = 0;
+    QualType qmem = ma.findMemberOffset(qt, member, &offset);
+    if (qmem.isInvalid()) return QualType_Invalid;
+    b.setValue(offset);
+    qt = getBuiltinQT(UInt32);
+    e.setType(qt);
+    return qt;
+}
+
+fn QualType Analyser.analyseToContainer(Analyser* ma, BuiltinExpr* b) {
+    // syntax: const? volatile? Type* to_container(Type, member, const? volatile? member*)
+    Expr* inner = b.getInner(); // Type
+    QualType qt = ma.analyseExpr(&inner, false, RHS);
+    if (qt.isInvalid()) return QualType_Invalid;
+
+    StructType* st = qt.getStructTypeOrNil();
+    if (!st) {
+        ma.error(inner.getLoc(), "to_container can only be used on struct types");
+        return QualType_Invalid;
+    }
+
+    StructTypeDecl* std = st.getDecl();
+    if (!ma.checkOpaque(std, inner.getLoc())) return QualType_Invalid;
+
+    // check member
+    Expr* member = b.getToContainerMember();
+    u32 offset = 0;
+    QualType qmem = ma.findMemberOffset(qt, member, &offset);
+    b.setValue(offset);
+    if (qmem.isInvalid()) return QualType_Invalid;
+
+    // check ptr
+    Expr** pptr = b.getToContainerPointer2();
+    QualType qptr = ma.analyseExpr(pptr, false, RHS);
+    if (qptr.isInvalid()) return QualType_Invalid;
+
+    // Note: 3rd argument may be const/volatile ptr: copy qualifiers to result type
+    PointerType* pt = qptr.getPointerType();
+    qt.copyQuals(pt.getInner());
+
+    // Construct expected pointer type with proper qualifiers
+    qmem.copyQuals(pt.getInner());
+    QualType expectedType = ma.builder.actOnPointerType(qmem);
+
+    if (!ma.conv_checker.checkAssign(expectedType, qptr, pptr, (*pptr).getLoc())) {
+        return QualType_Invalid;
+    }
+
+    return ma.builder.actOnPointerType(qt);
+}
+
+// XXX: should use a similar approach for designated initializers
+fn QualType Analyser.findMemberOffset(Analyser* ma, QualType qt, Expr* member, u32 *base) {
+    switch (member.getKind()) {
+    case Identifier: {
+        IdentifierExpr* i = (IdentifierExpr*)member;
+        Decl* d = ma.findStructMemberOffset(qt, i.getNameIdx(), member.getLoc(), base);
+        if (!d) return QualType_Invalid;
+        qt = d.getType();
+        i.setDecl(d);  // probably useless
+        i.setKind(StructMember);
+        member.setLValue();
+        member.setType(qt);
+        return qt;
+    }
+    case ArraySubscript: {
+        ArraySubscriptExpr* ae = (ArraySubscriptExpr*)member;
+        qt = ma.findMemberOffset(qt, ae.getBase(), base);
+        if (qt.isInvalid()) return QualType_Invalid;
+        ArrayType* ap = qt.getArrayTypeOrNil();
+        if (!ap) {
+            ma.error(member.getLoc(), "base member is not an array");
+            return QualType_Invalid;
+        }
+        Expr** ep = ae.getIndex2();
+        QualType et = ma.analyseConstExpr(ep, true);
+        if (et.isInvalid()) return QualType_Invalid;
+        Expr* de = *ep;
+        if (!de.isCtv()) {
+            ma.errorRange(de.getLoc(), de.getRange(), "array index is not a compile-time value");
+            return QualType_Invalid;
+        }
+        QualType canon = et.getImplType();
+        if (!canon.isInteger() && !canon.isBool()) {
+            ma.errorRange(de.getLoc(), de.getRange(), "array index expression must have integer type");
+            return QualType_Invalid;
+        }
+        // check range
+        u32 size = ap.getSize();
+        Value val = ast.evalExpr(de);
+        u64 idx = val.as_u64();
+        if (size && idx > size) { // dont give error if arrays has size 0 (allowed for struct members)
+            ma.errorRange(de.getLoc(), de.getRange(), "array index '%d' greater than array length '%d'", idx, size);
+            return QualType_Invalid;
+        }
+        qt = ap.getElemType();
+        *base += idx * qt.getSize();
+        member.setType(qt);
+        return qt;
+    }
+    case Member: {
+        MemberExpr* m = (MemberExpr*)member;
+        u32 start = 0;
+        if (m.hasExpr()) {
+            qt = ma.findMemberOffset(qt, m.getBaseExpr(), base);
+            if (qt.isInvalid()) return QualType_Invalid;
+            start = 1;
+        }
+        for (u32 i = start; i < 2; i++) {
+            Decl* d = ma.findStructMemberOffset(qt, m.getNameIdx(i), m.getLoc(i), base);
+            if (!d) return QualType_Invalid;
+            qt = d.getType();
+            m.setDecl(d, i);  // probably useless
+        }
+        member.setType(qt);
+        return qt;
+    }
+    default:
+        ma.error(member.getLoc(), "invalid field designator");
+        return QualType_Invalid;
+    }
+}
+
+fn Decl* Analyser.findStructMemberOffset(Analyser* ma, QualType qt, u32 name_idx, SrcLoc loc, u32* base) {
+    StructType* tp = qt.isInvalid() ? nil : qt.getStructTypeOrNil();
+    if (!tp) {
+        ma.error(loc, "base is not a struct or union");
+        return nil;
+    }
+    StructTypeDecl* s = tp.getDecl();
+    Decl* d = s.findMember(name_idx, base);
+    if (d) d.setUsed();
+    else ma.memberError(name_idx, loc, s);
+    return d;
+}
+
+fn QualType Analyser.analyseVaArg(Analyser* ma, BuiltinExpr* b) {
+    Expr* e = (Expr*)b;
+    // syntax va_arg(va_list ap, type)
+    TypeRef* ref = b.getVaArgTypeRef();
+    QualType destType = ma.analyseTypeRef(ref, true);
+    QualType srcType = ma.analyseExpr(b.getInner2(), true, RHS);
+    if (srcType.isInvalid() || destType.isInvalid()) return QualType_Invalid;
+    // XXX should check that srcType is va_list
+    Expr* inner = b.getInner();
+    //e.copyConstantFlags(inner);
+    //e.copyValType(inner);
+    b.setVaArgDestType(destType);
+
+    if (!destType.isScalar()) {
+        ma.error(ref.getLoc(), "used type '%s' where arithmetic or pointer type is required", destType.diagName());
+        return QualType_Invalid;
+    }
+    e.setType(destType);
+
+    return destType;
+}
+

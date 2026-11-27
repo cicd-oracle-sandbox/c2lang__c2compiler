@@ -1,0 +1,355 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2i_generator;
+
+import ast { * }
+import string_buffer { StringBuf }
+
+fn void Generator.emitExpr(Generator* gen, StringBuf* out, const Expr* e) {
+    switch (e.getKind()) {
+    case IntegerLiteral:
+        IntegerLiteral.printLiteral((IntegerLiteral*)e, out);
+        break;
+    case FloatLiteral:
+        FloatLiteral.printLiteral((FloatLiteral*)e, out);
+        break;
+    case BooleanLiteral:
+        BooleanLiteral.printLiteral((BooleanLiteral*)e, out);
+        break;
+    case CharLiteral:
+        CharLiteral.printLiteral((CharLiteral*)e, out);
+        break;
+    case StringLiteral:
+        gen.emitStringLiteral(out, (StringLiteral*)e);
+        break;
+    case Nil:
+        out.add("nil");
+        break;
+    case Identifier:
+        // add prefix if external
+        const IdentifierExpr* i = (IdentifierExpr*)e;
+        Decl* d = i.getDecl();
+        if (d.getModule() != gen.mod) {
+            out.add(d.getFullName());
+        } else {
+            gen.emitName(out, d);
+        }
+        break;
+    case Type:
+        // for sizeof/countof argument?
+        gen.emitTypePre(out, e.getType());
+        gen.emitTypePost(out, e.getType());
+        break;
+    case Call:
+        gen.emitCall(out, (CallExpr*)e);
+        break;
+    case InitList:
+        gen.emitInitListExpr(out, (InitListExpr*)e);
+        break;
+    case FieldDesignatedInit:
+        gen.emitFieldDesigExpr(out, (FieldDesignatedInitExpr*)e);
+        break;
+    case ArrayDesignatedInit:
+        gen.emitArrayDesigExpr(out, (ArrayDesignatedInitExpr*)e);
+        break;
+    case BinaryOperator:
+        gen.emitBinaryOperator(out, (BinaryOperator*)e);
+        break;
+    case UnaryOperator:
+        gen.emitUnaryOperator(out, (UnaryOperator*)e);
+        break;
+    case ConditionalOperator:
+        ConditionalOperator* c = (ConditionalOperator*)e;
+        gen.emitExpr(out, c.getCond());
+        out.add(" ? ");
+        gen.emitExpr(out, c.getLHS());
+        out.add(" : ");
+        gen.emitExpr(out, c.getRHS());
+        break;
+    case Builtin:
+        gen.emitBuiltinExpr(out, (BuiltinExpr*)e);
+        break;
+    case ArraySubscript:
+        const ArraySubscriptExpr* a = (ArraySubscriptExpr*)e;
+        gen.emitExpr(out, a.getBase());
+        out.add1('[');
+        gen.emitExpr(out, a.getIndex());
+        out.add1(']');
+        break;
+    case Member:
+        gen.emitMemberExpr(out, (MemberExpr*)e);
+        break;
+    case Paren:
+        const ParenExpr* p = (ParenExpr*)e;
+        out.lparen();
+        gen.emitExpr(out, p.getInner());
+        out.rparen();
+        break;
+    case BitOffset:
+        const BitOffsetExpr* bo = (BitOffsetExpr*)e;
+        gen.emitExpr(out, bo.getLHS());
+        out.add(" : ");
+        gen.emitExpr(out, bo.getRHS());
+        break;
+    case ExplicitCast:
+        ExplicitCastExpr* c = (ExplicitCastExpr*)e;
+        if (c.getCStyle()) {
+            out.add1('(');
+            gen.emitTypePre(out, c.getDestType());
+            out.add1(')');
+            gen.emitExpr(out, c.getInner());
+        } else {
+            out.add1('(');
+            gen.emitTypePre(out, c.getDestType());
+            out.add(")(");
+            gen.emitExpr(out, c.getInner());
+            out.add1(')');
+        }
+        break;
+    case ImplicitCast:
+        const ImplicitCastExpr* i = (ImplicitCastExpr*)e;
+        gen.emitExpr(out, i.getInner());
+        break;
+    case Range:
+        const RangeExpr* b = (RangeExpr*)e;
+        // Output range boundary expressions if present in source code
+        if (Expr* lhs = b.getLHS()) {
+            if (lhs.getLoc()) {
+                gen.emitExpr(out, lhs);
+                out.space();
+            }
+        }
+        out.add("...");
+        if (Expr* rhs = b.getRHS()) {
+            if (rhs.getLoc()) {
+                out.space();
+                gen.emitExpr(out, rhs);
+            }
+        }
+        break;
+    case NamedArgument:
+        const NamedArgument* ne = (const NamedArgument*)e;
+        out.add(gen.idx2name(ne.getNameIdx()));
+        out.add(": ");
+        gen.emitExpr(out, ne.getInner());
+        break;
+    case Alternate:
+        const AlternateExpr* n = (AlternateExpr*)e;
+        gen.emitExpr(out, n.getOriginal());
+        break;
+    }
+}
+
+fn void Generator.emitStringLiteral(Generator* gen, StringBuf* out, const StringLiteral* s) {
+    s.printLiteral(out);
+}
+
+fn void Generator.emitBinaryOperator(Generator* gen, StringBuf* out, const BinaryOperator* b) {
+    gen.emitExpr(out, b.getLHS());
+    out.print(" %s ", b.getOpcodeStr());
+    gen.emitExpr(out, b.getRHS());
+}
+
+fn void Generator.emitUnaryOperator(Generator* gen, StringBuf* out, const UnaryOperator* u) {
+    if (u.isBefore()) {
+        out.add(u.getOpcodeStr());
+        gen.emitExpr(out, u.getInner());
+    } else {
+        gen.emitExpr(out, u.getInner());
+        out.add(u.getOpcodeStr());
+    }
+}
+
+fn void Generator.emitMemberExpr(Generator* gen, StringBuf* out, const MemberExpr* m) {
+    const Expr* base = m.getBaseExpr();
+    if (base) {
+        gen.emitExpr(out, base);
+    } else {
+        Decl* d = m.getDecl(0);
+        if (d.getModule() != gen.mod) {
+            out.add(d.getFullName());
+        } else {
+            gen.emitName(out, d);
+        }
+    }
+    out.add1('.');
+    out.add(gen.idx2name(m.getNameIdx(1)));
+}
+
+fn void Generator.emitFieldDesigExpr(Generator* gen, StringBuf* out, const FieldDesignatedInitExpr* fdi) {
+    out.add1('.');
+    out.add(fdi.getFieldName());
+    out.add(" = ");
+    gen.emitExpr(out, fdi.getInit());
+}
+
+fn void Generator.emitArrayDesigExpr(Generator* gen, StringBuf* out, const ArrayDesignatedInitExpr* ad) {
+    out.add1('[');
+    if (ad.hasExpr1()) {
+        gen.emitExpr(out, ad.getExpr1());
+        if (ad.getKind() != Single) out.space();
+    }
+    switch (ad.getKind()) {
+    case Single:                break;
+    case Range: out.add("..."); break;
+    case Slice: out.add(":");   break;
+    }
+    if (ad.hasExpr2()) {
+        out.space();
+        gen.emitExpr(out, ad.getExpr2());
+    }
+    out.add("] = ");
+    gen.emitExpr(out, ad.getInit());
+}
+
+fn void Generator.emitBuiltinExpr(Generator* gen, StringBuf* out, const BuiltinExpr* b) {
+    switch (b.getKind()) {
+    case Sizeof:
+        out.add("sizeof(");
+        gen.emitExpr(out, b.getInner());
+        out.rparen();
+        break;
+    case Countof:
+    case OffsetOf:
+        // TODO: generate c2 source?
+        // TODO: should be typed explicitly?
+        out.print("%d", b.getValue());
+        return;
+    case ToContainer:
+        out.add("to_container("); // type, member, ptr
+        gen.emitExpr(out, b.getInner());
+        out.add(", ");
+        gen.emitExpr(out, b.getToContainerMember());
+        out.add(", ");
+        gen.emitExpr(out, b.getToContainerPointer());
+        out.rparen();
+        break;
+    case VaArg:
+        out.add("va_arg(");
+        gen.emitExpr(out, b.getInner());
+        out.add(", ");
+        gen.emitTypePre(out, b.getVaArgDestType());
+        out.add1(')');
+        break;
+    }
+}
+
+fn void Generator.emitCall(Generator* gen, StringBuf* out, const CallExpr* call) {
+    // options:
+    // - regular (prefix.)name(..)                  -> if external, prefix
+    // - struct function a.foo(..)  A.foo(..)       -> if external, prefix
+    // - via pointer -> <expr>(..)                  -> ..
+    // - template -> not implemented yet
+
+    assert(!call.isTemplateCall()); // TODO
+
+    Expr* func = call.getFunc();
+    assert(func.isImplicitCast());
+    ImplicitCastExpr* ic = (ImplicitCastExpr*)func;
+    func = ic.getInner();
+
+    gen.emitExpr(out, func);
+    out.lparen();
+
+    // arguments
+    u32 num_args = call.getNumArgs();
+    Expr** args = ((CallExpr*)call).getArgs();
+    for (u32 i = 0; i < call.getNumArgs(); i++) {
+        if (i != 0) out.add(", ");
+        gen.emitExpr(out, call.getArg(i));
+    }
+
+    out.rparen();
+}
+
+// output initializers as compact lines with aligned columns if possible
+fn void Generator.emitInitListExpr(Generator* gen, StringBuf* out, InitListExpr* ile) {
+    Expr** values = ile.getValues();
+    u32 num_values = ile.getNumValues();
+    out.add1('{');
+    if (!num_values) {
+        out.add1('}');
+        return;
+    }
+    gen.indent++;
+    u32 total_len = 0;
+    u32 max_len = 0;
+    u32 start_offset = out.size();
+    u32 start_column = out.getColumn();
+    u32 num_cols = 1;
+    for (u32 i = 0;;) {
+        out.space();
+        Expr* v = values[i++];
+        ExprKind k = v.getKind();
+        if (k == InitList || k == FieldDesignatedInit || k == ArrayDesignatedInit) break;
+        u32 pos = out.size();
+        gen.emitExpr(out, v);
+        u32 len = out.size() - pos;
+        total_len += len + 2;
+        if (len > max_len) max_len = len;
+        if (i == num_values) {
+            if (start_column + total_len <= 110) {
+                out.space();
+                gen.indent--;
+                out.add1('}');
+                return;
+            }
+            num_cols = num_values;
+            break;
+        }
+        out.add1(',');
+        if (len > 32) break;
+    }
+    // restart output on multiple lines
+    bool align_columns = false;
+    static u32[] cols = { 32, 30, 20, 16, 10, 8, 5, 4, 2, 1 }
+    u32 j = 0;
+    start_column = gen.indent * out.indent_step;
+    while (num_cols > 1 && start_column + num_cols * (max_len + 2) > 110) {
+        while (num_cols <= cols[j] || ((cols[j] & (cols[j] - 1)) && !(num_values & (num_values - 1)))) j++;
+        num_cols = cols[j];
+        align_columns = true;
+    }
+    out.trim(out.size() - start_offset);
+    out.newline();
+    out.indent(gen.indent);
+    u32 line_offset = out.size();
+    u32 col = 0;
+    for (u32 i = 0;;) {
+        gen.emitExpr(out, values[i++]);
+        if (i == num_values) break;
+        out.add1(',');
+        col++;
+        if (col == num_cols) {
+            out.newline();
+            out.indent(gen.indent);
+            line_offset = out.size();
+            col = 0;
+        } else {
+            u32 spaces = 1;
+            if (align_columns) {
+                u32 pos = out.size() - line_offset;
+                u32 min_pos = col * (max_len + 2);
+                if (pos < min_pos) spaces = min_pos - pos;
+            }
+            while (spaces--) out.space();
+        }
+    }
+    gen.indent--;
+    out.newline();
+    out.indent(gen.indent);
+    out.add1('}');
+}

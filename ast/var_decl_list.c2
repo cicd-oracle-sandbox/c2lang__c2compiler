@@ -1,0 +1,78 @@
+/* Copyright 2022-2026 Bas van den Berg, Charlie Gordon
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import stdlib { malloc, free, realloc }
+import string { memcpy }
+
+public type VarDeclList struct {
+    u32 count;
+    u32 capacity;
+    VarDecl** data;
+    VarDecl*[4] stash;
+}
+
+public fn void VarDeclList.init(VarDeclList* l) {
+    l.count = 0;
+    l.capacity = countof(l.stash);
+    l.data = l.stash;
+}
+
+public fn void VarDeclList.free(VarDeclList* l) {
+    if (l.capacity > countof(l.stash)) free(l.data);
+    l.data = nil;
+    l.count = 0;
+    l.capacity = 0;
+}
+
+public fn void VarDeclList.clear(VarDeclList* l) @(unused) {
+    l.count = 0;
+}
+
+fn void VarDeclList.resize(VarDeclList* l) {
+    if (l.capacity < countof(l.stash)) {
+        l.capacity = countof(l.stash);
+        l.data = l.stash;
+    } else
+    if (l.capacity == countof(l.stash)) {
+        l.capacity = l.capacity * 2;
+        l.data = malloc(l.capacity * sizeof(*l.data));
+        memcpy(l.data, l.stash, countof(l.stash) * sizeof(*l.data));
+    } else {
+        l.capacity = l.capacity * 2;
+        l.data = realloc(l.data, l.capacity * sizeof(*l.data));
+    }
+}
+
+public fn void VarDeclList.add(VarDeclList* l, VarDecl* d) {
+    if (l.count >= l.capacity) l.resize();
+
+    l.data[l.count] = d;
+    l.count++;
+}
+
+public fn u32 VarDeclList.size(const VarDeclList* l) {
+    return l.count;
+}
+
+public fn VarDecl* VarDeclList.get(const VarDeclList* l, u32 idx) @(unused) {
+    return l.data[idx];
+}
+
+public fn VarDecl** VarDeclList.getData(const VarDeclList* l) {
+    return l.data;
+}
+

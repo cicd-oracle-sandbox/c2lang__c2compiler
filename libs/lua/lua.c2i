@@ -1,0 +1,216 @@
+module lua extern "C";
+
+// from luaconf
+const unsigned LUAI_MAXSTACK = 1000000;
+
+const char[] LUA_SIGNATURE = "\x1bLua";
+
+const int LUA_MULTRET = -1;
+const int LUA_REGISTRYINDEX = -LUAI_MAXSTACK - 1000;
+
+const int LUA_OK          = 0;
+const int LUA_YIELD       = 1;
+const int LUA_ERRRUN      = 2;
+const int LUA_ERRSYNTAX   = 3;
+const int LUA_ERRMEM      = 4;
+const int LUA_ERRGCMM     = 5;
+const int LUA_ERRERR      = 6;
+
+// basic types
+const int LUA_TNONE           = -1;
+const int LUA_TNIL            = 0;
+const int LUA_TBOOLEAN        = 1;
+const int LUA_TLIGHTUSERDATA  = 2;
+const int LUA_TNUMBER         = 3;
+const int LUA_TSTRING         = 4;
+const int LUA_TTABLE          = 5;
+const int LUA_TFUNCTION       = 6;
+const int LUA_TUSERDATA       = 7;
+const int LUA_TTHREAD         = 8;
+const int LUA_NUMTAGS         = 9;
+
+const int LUA_MINSTACK        = 20;
+
+// predefined values in the registry
+const int LUA_RIDX_MAINTHREAD = 1;
+const int LUA_RIDX_GLOBALS    = 2;
+const int LUA_RIDX_LAST       = LUA_RIDX_GLOBALS;
+
+typedef double LUA_NUMBER;
+typedef int LUA_INTEGER;
+typedef unsigned LUA_UNSIGNED;
+typedef long long LUA_KCONTEXT;
+
+type Number LUA_NUMBER @(cname="lua_Number");
+// TODO can be defined as int or long
+type Integer int @(cname="lua_integer");
+//type Integer LUA_INTEGER @(cname="lua_Integer");
+type Unsigned LUA_UNSIGNED @(cname="lua_Unsigned");
+type KContext LUA_KCONTEXT @(cname="lua_KContext");
+
+type CFunction fn i32 (State *L) @(cname="lua_CFunction");
+type KFunction fn int (State *L, int status, KContext ctx) @(cname="lua_KFunction");
+type Reader fn const char* (State *L, void *ud, size_t *sz) @(cname="lua_Reader");
+type Writer fn void* (State *L, const void *p, size_t sz, void *ud) @(cname="lua_Writer");
+type Alloc fn void* (void *ud, void *ptr, size_t osize, size_t nsize) @(cname="lua_Alloc");
+
+type State struct @(cname="lua_State") { }
+
+const char* lua_ident;
+
+
+// state manipulation
+State *newstate(Alloc f, void *ud) @(cname="lua_newstate");
+void close(State *L) @(cname="lua_close");
+State *newthread(State *L) @(cname="lua_newthread");
+
+CFunction atpanic(State *L, CFunction panicf) @(cname="lua_atpanic");
+
+const Number *version(State *L) @(cname="lua_version");
+
+
+// basic stack manipulation
+int absindex(State *L, int idx) @(cname="lua_absindex");
+int gettop(State *L) @(cname="lua_gettop");
+void settop(State *L, int idx) @(cname="lua_settop");
+void pushvalue(State *L, int idx) @(cname="lua_pushvalue");
+void rotate(State *L, int idx, int n) @(cname="lua_rotate");
+void copy(State *L, int fromidx, int toidx) @(cname="lua_copy");
+int checkstack(State *L, int n) @(cname="lua_checkstack");
+
+void xmove(State *from, State *to, int n) @(cname="lua_xmove");
+
+
+// access functions (stack -> C)
+int isnumber(State *L, int idx) @(cname="lua_isnumber");
+int isstring(State *L, int idx) @(cname="lua_isstring");
+int iscfunction(State *L, int idx) @(cname="lua_iscfunction");
+int isinteger(State *L, int idx) @(cname="lua_isinteger");
+int isuserdata(State *L, int idx) @(cname="lua_isuserdata");
+int lua_type(State *L, int idx) @(cname="lua_type");
+const char* typename(State *L, int tp) @(cname="lua_typename");
+
+Number tonumberx(State *L, int idx, int *isnum) @(cname="lua_tonumberx");
+Integer tointegerx(State *L, int idx, int *isnum) @(cname="lua_tointegerx");
+int toboolean(State *L, int idx) @(cname="lua_toboolean");
+const char* tolstring(State *L, int idx, size_t *len) @(cname="lua_tolstring");
+size_t rawlen(State *L, int idx) @(cname="lua_rawlen");
+CFunction tocfunction(State *L, int idx) @(cname="lua_tocfunction");
+void *touserdata(State *L, int idx) @(cname="lua_touserdata");
+const void *topointer(State *L, int idx) @(cname="lua_topointer");
+
+const u8 LUA_OPADD      = 0;    // ORDER TM, ORDER OP
+const u8 LUA_OPSUB      = 1;
+const u8 LUA_OPMUL      = 2;
+const u8 LUA_OPMOD      = 3;
+const u8 LUA_OPPOW      = 4;
+const u8 LUA_OPDIV      = 5;
+const u8 LUA_OPIDIV     = 6;
+const u8 LUA_OPBAND     = 7;
+const u8 LUA_OPBOR      = 8;
+const u8 LUA_OPBXOR     = 9;
+const u8 LUA_OPSHL      = 10;
+const u8 LUA_OPSHR      = 11;
+const u8 LUA_OPUNM      = 12;
+const u8 LUA_OPBNOT     = 13;
+
+void arith(State *L, int op) @(cname="lua_arith");
+
+const u8 LUA_OPEQ   = 0;
+const u8 LUA_OPLT   = 1;
+const u8 LUA_OPLE   = 2;
+
+int rawequal(State *L, int idx1, int idx2) @(cname="lua_rawequal");
+int compare(State *L, int idx1, int idx2, int op) @(cname="lua_compare");
+
+
+// push functions (C -> stack)
+void pushnil(State *L) @(cname="lua_pushnil");
+void pushnumber(State *L, Number n) @(cname="lua_pushnumber");
+void pushinteger(State *L, Integer n) @(cname="lua_pushinteger");
+const char* pushlstring(State *L, const char* s, size_t len) @(cname="lua_pushlstring");
+const char* pushstring(State *L, const char* s) @(cname="lua_pushstring");
+const char* pushvfstring(State *L, const char* fmt, va_list argp) @(cname="lua_pushvfstring");
+const char* pushfstring(State *L, const char* fmt @(printf_format), ...) @(cname="lua_pushfstring");
+void pushcclosure(State *L, CFunction func, int n) @(cname="lua_pushcclosure");
+void pushboolean(State *L, int b) @(cname="lua_pushboolean");
+void pushlightuserdata(State *L, void *p) @(cname="lua_pushlightuserdata");
+int pushthread(State *L) @(cname="lua_pushthread");
+
+
+// get functions (Lua -> stack)
+int getglobal(State *L, const char* name) @(cname="lua_getglobal");
+int gettable(State *L, int idx) @(cname="lua_gettable");
+int getfield(State *L, int idx, const char* k) @(cname="lua_getfield");
+int geti(State *L, int idx, Integer n) @(cname="lua_geti");
+int rawget(State *L, int idx) @(cname="lua_rawget");
+int rawgeti(State *L, int idx, Integer n) @(cname="lua_rawgeti");
+int rawgetp(State *L, int idx, const void *p) @(cname="lua_rawgetp");
+
+void createtable(State *L, int narr, int nrec) @(cname="lua_createtable");
+void *newuserdata(State *L, size_t sz) @(cname="lua_newuserdata");
+int getmetatable(State *L, int objindex) @(cname="lua_getmetatable");
+int getuservalue(State *L, int idx) @(cname="lua_getuservalue");
+
+
+// set functions (stack -> Lua)
+void setglobal(State *L, const char* name) @(cname="lua_setglobal");
+void settable(State *L, int idx) @(cname="lua_settable");
+void setfield(State *L, int idx, const char* k) @(cname="lua_setfield");
+void seti(State *L, int idx, Integer n) @(cname="lua_seti");
+void rawset(State *L, int idx) @(cname="lua_rawset");
+void rawseti(State *L, int idx, Integer n) @(cname="lua_rawseti");
+void rawsetp(State *L, int idx, const void *p) @(cname="lua_rawsetp");
+int setmetatable(State *L, int objindex) @(cname="lua_setmetatable");
+void setuservalue(State *L, int idx) @(cname="lua_setuservalue");
+
+
+// 'load' and 'call' functions (load and run Lua code)
+void callk(State *L, int nargs, int nresults,
+                    KContext ctx, KFunction k) @(cname="lua_callk");
+
+//#define lua_call(L,n,r)     lua_callk(L, (n), (r), 0, NULL)
+
+int pcallk(State *L, int nargs, int nresults, int errfunc,
+                      KContext ctx, KFunction k) @(cname="lua_pcallk");
+//#define lua_pcall(L,n,r,f)  lua_pcallk(L, (n), (r), (f), 0, NULL)
+
+int load(State *L, Reader reader, void *dt,
+                    const char* chunkname, const char* mode) @(cname="lua_load");
+
+int dump(State *L, Writer writer, void *data, int strip) @(cname="lua_dump");
+
+
+// coroutine functions
+int yieldk(State *L, int nresults, KContext ctx,
+                      KFunction k) @(cname="lua_yieldk");
+int resume(State *L, State *from, int narg) @(cname="lua_resume");
+int status(State *L) @(cname="lua_status");
+int isyieldable(State *L) @(cname="lua_isyieldable");
+
+//#define lua_yield(L,n)      lua_yieldk(L, (n), 0, NULL)
+
+
+// garbage-collection function and options
+const u8 LUA_GCSTOP       = 0;
+const u8 LUA_GCRESTART    = 1;
+const u8 LUA_GCCOLLECT    = 2;
+const u8 LUA_GCCOUNT      = 3;
+const u8 LUA_GCCOUNTB     = 4;
+const u8 LUA_GCSTEP       = 5;
+const u8 LUA_GCSETPAUSE   = 6;
+const u8 LUA_GCSETSTEPMUL = 7;
+const u8 LUA_GCISRUNNING  = 9;
+
+int gc(State *L, int what, int data) @(cname="lua_gc");
+
+
+// miscellaneous functions
+int error(State *L) @(cname="lua_error");
+int next(State *L, int idx) @(cname="lua_next");
+void concat(State *L, int n) @(cname="lua_concat");
+void len(State *L, int idx) @(cname="lua_len");
+size_t stringtonumber(State *L, const char* s) @(cname="lua_stringtonumber");
+Alloc getallocf(State *L, void **ud) @(cname="lua_getallocf");
+void setallocf(State *L, Alloc f, void *ud) @(cname="lua_setallocf");
+

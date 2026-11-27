@@ -1,0 +1,69 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ir;
+
+public type InstrKind enum u8 (public const char* const str) {
+    None        : { "none" },   // used when removing instructions
+
+    // Arithmetic and Bits
+    Add         : { "add" },
+    Sub         : { "sub" },
+    Div         : { "div" },
+    Rem         : { "rem" },
+    Mul         : { "mul" },
+    IDiv        : { "idiv" },
+    And         : { "and" },
+    Or          : { "or" },
+    Xor         : { "xor" },
+    Shr         : { "shl" },
+    Shl         : { "shr" },
+    // Comparisons
+    CmpNe       : { "icmp ne" },
+    CmpEq       : { "icmp eq" },
+    CmpLt       : { "icmp lt" },
+    CmpGt       : { "icmp gt" },
+    CmpLe       : { "icmp le" },
+    CmpGe       : { "icmp ge" },
+    // Memory
+    Load1       : { "load1" },
+    Load2       : { "load2" },
+    Load4       : { "load4" },
+    Load8       : { "load8" },
+    Store1      : { "store1" },
+    Store2      : { "store2" },
+    Store4      : { "store4" },
+    Store8      : { "store8" },
+    // Stack Allocation
+    Alloc1      : { "alloc1" },
+    Alloc2      : { "alloc2" },
+    Alloc4      : { "alloc4" },
+    Alloc8      : { "alloc8" },
+    // Jump instructions
+    Jmp         : { "jmp" },
+    JmpIf       : { "jmp_if" },
+    Ret         : { "ret" },
+    Halt        : { "halt" },
+    Call        : { "call" },
+    Copy        : { "copy" },
+    // Pseudo instructions (must be converted before converting to ASM)
+    Arch        : { "(arch)" }, // arch dependent
+    Param       : { "param" },
+    Arg         : { "arg" },
+    Switch      : { "switch" },
+    Phi         : { "phi" },
+    Comment     : { "comment" }, // KEEP THIS THE LAST OPERATION!
+}
+

@@ -1,0 +1,599 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module module_analyser;
+
+import ast { * }
+import ctv_analyser;
+import init_checker { InitChecker }
+import src_loc { SrcLoc }
+import value_type { Value }
+
+fn bool Analyser.analyseInitExpr(Analyser* ma, Expr** e_ptr, QualType expectedType, SrcLoc assignLoc, bool is_bitfield, bool is_default_param) {
+    Expr* e = *e_ptr;
+
+    if (!is_bitfield) {
+        if (e.isInitList()) {
+            return ma.analyseInitListExpr((InitListExpr*)e, expectedType);
+        }
+
+        if (e.isNamedArgument()) {
+            NamedArgument* n = (NamedArgument*)e;
+            return ma.analyseInitExpr(n.getInner2(), expectedType, assignLoc, false, is_default_param);
+        }
+
+        if (e.isStringLiteral()) {
+            // could be (const) char* x = "text" OR (const) char[] x = "text";
+            // check array case for overflow
+            // when doing char[] a = "abc" -> string is not an LValue
+            // when doing char*  a = "abc" -> string is lvalue (so insert ArrayToPointerDecay)
+            ArrayType* at = expectedType.getArrayTypeOrNil();
+            if (at) {
+                // check that element type is char/i8/u8
+                QualType elem = at.getElemType();
+                if (!elem.isCharCompatible()) {
+                    ma.errorRange(assignLoc, e.getRange(), "cannot initialize array of '%s' with a string literal", elem.diagName());
+                    return false;
+                }
+
+                QualType st = e.getType();
+                ArrayType* at2 = st.getArrayType();
+                u32 rhs_len = at2.getSize();
+                if (at.hasSize()) {
+                    u32 lhs_len = at.getSize();
+                    if (rhs_len > lhs_len) {
+                        ma.errorRange(assignLoc, e.getRange(), "initializer-string for char array is too long");
+                        return false;
+                    }
+                } else {
+                    at.setSize(rhs_len);
+                }
+                e.setRValue();
+            } else {
+                // need to add ArrayToPointerDecay (otherwise checker can get arrays)
+                QualType qt = ma.analyseExpr(e_ptr, true, RHS);
+                // TODO check qt?
+                e = *e_ptr;
+                if (!ma.conv_checker.checkAssign(expectedType, e.getType(), e_ptr, assignLoc)) return false;
+            }
+            return true;
+        }
+
+        if (expectedType.isArray()) {
+            ma.error(assignLoc, "array initializer must be an initializer list");
+            return false;
+        }
+    }
+
+    // special case for enum init without prefix (eg Color c = Green)
+    if (ma.checkEnumArg(e_ptr, expectedType)) return true;
+
+    QualType res = ma.analyseExpr(e_ptr, true, RHS);
+    if (res.isInvalid()) return false;
+    e = *e_ptr; // re-read since ImplicitCasts could have been inserted
+
+    if (e.isCtv()) {
+        if (is_bitfield) return true;
+
+        // TODO Canonical?
+        if (expectedType.isBuiltin() && !res.isPointer()) {
+            // TODO should insert `BooleanCast` implicit cast
+            if (expectedType.isBool()) return true;
+            if (!ctv_analyser.checkRange(ma.diags, expectedType, e)) return false;
+            if (res.getType() != expectedType.getType()) {
+                ma.builder.insertImplicitCast(IntegralCast, e_ptr, expectedType);
+            }
+            return true;
+        }
+    }
+
+    if (!ma.conv_checker.checkAssign(expectedType, res, e_ptr, assignLoc)) return false;
+
+    if (!ma.curFunction && !e.isCtv()) {
+        if (!e.isCtc()) {
+            if (is_default_param) {
+                ma.errorRange(e.getLoc(), e.getRange(), "default parameter value is not a compile-time value");
+            } else {
+                ma.errorRange(e.getLoc(), e.getRange(), "initializer element is not a compile-time constant");
+            }
+            return false;
+        }
+
+        if (expectedType.needsCtvInit()) {
+            ma.errorRange(e.getLoc(), e.getRange(), "initializer element is not a compile-time value");
+            return false;
+        }
+    }
+    //e.setType(expectedType); needed here?
+    return true;
+}
+
+fn bool Analyser.checkEnumArg(Analyser* ma, Expr** e_ptr, QualType expectedType) {
+    Expr* e = *e_ptr;
+    if (expectedType.isEnum()) {
+        // Note: can also be another enum variable! (Color c = prevColor)
+        EnumType* et = expectedType.getEnum();
+        EnumTypeDecl* etd = et.getDecl();
+        if (e.isIdentifier()) {
+            IdentifierExpr* ie = (IdentifierExpr*)e;
+            EnumConstantDecl* ecd = etd.findConstant(ie.getNameIdx());
+            if (ecd) {
+                Decl* d = (Decl*)ecd;
+                d.setUsed();
+                e.setType(expectedType);
+                ie.setDecl(d);
+                IdentifierKind kind = ma.setExprFlags(e_ptr, d);
+                ie.setKind(kind);
+                return true;
+            } // else could be Color c = prevColor;
+        } else
+        if (e.getKind() == ConditionalOperator) {
+            ConditionalOperator* op = (ConditionalOperator*)e;
+            ma.checkEnumArg(op.getLHS2(), expectedType);
+            ma.checkEnumArg(op.getRHS2(), expectedType);
+        }
+    }
+    return false;
+}
+
+fn bool Analyser.analyseInitListExpr(Analyser* ma, InitListExpr* ile, QualType expectedType) {
+    const Type* t = expectedType.getTypeOrNil();
+    if (t.isArrayType()) {
+        ile.setIsArray();
+        return ma.analyseInitListArray(ile, expectedType);
+    }
+
+    if (t.isStructType()) {
+        return ma.analyseInitListStruct(ile, expectedType);
+    }
+
+    Expr* e = (Expr*)ile;
+    ma.error(e.getLoc(), "cannot initialize variable of type '%s' with initializer list", expectedType.diagName());
+    return false;
+}
+
+fn bool Analyser.analyseArrayDesignatorIndex(Analyser* ma, Expr** ep, bool isEnumIndex, QualType indexType) {
+    QualType qt;
+
+    if (!*ep) return true;
+    if (isEnumIndex && ma.checkEnumArg(ep, indexType)) {
+        qt = indexType;
+    } else {
+        qt = ma.analyseConstExpr(ep, true);
+    }
+    if (qt.isInvalid()) return false;
+    Expr* de = *ep;
+    if (!de.isCtv()) {
+        ma.errorRange(de.getLoc(), de.getRange(), "array index is not a compile-time value");
+        return false;
+    }
+    QualType canon = qt.getImplType();
+    if (!canon.isInteger() && !canon.isBool()) {
+        ma.errorRange(de.getLoc(), de.getRange(), "array designator expression must have integer type");
+        return false;
+    }
+    return true;
+
+    // TODO: compute index value, check if designator < array length if specified
+}
+
+// Note: this function should only be called from analyseInitListArray directly!
+fn bool Analyser.analyseArrayDesignatedInit(Analyser* ma, Expr* e, QualType expectedType, bool isEnumIndex, QualType indexType) {
+    ArrayDesignatedInitExpr* ad = (ArrayDesignatedInitExpr*)e;
+    if (ad.hasExpr1()) {
+        if (!ma.analyseArrayDesignatorIndex(ad.getExpr1Ptr(), isEnumIndex, indexType)) return false;
+    }
+    if (ad.hasExpr2()) {
+        if (ad.getKind() == Slice) {
+            if (!ma.analyseArrayDesignatorIndex(ad.getExpr2Ptr(), false, getBuiltinQT(UInt32))) return false;
+        } else {
+            if (!ma.analyseArrayDesignatorIndex(ad.getExpr2Ptr(), isEnumIndex, indexType)) return false;
+        }
+    }
+
+    Expr* val = ad.getInit();
+    if (val.isInitList()) {
+        return ma.analyseInitListExpr((InitListExpr*)val, expectedType);
+    }
+    if (!ma.analyseInitExpr(ad.getInit2(), expectedType, val.getLoc(), false, false)) return false;
+
+    val = ad.getInit(); // re-read because of ImplicitCasts
+    e.copyConstantFlags(val);
+    e.setType(expectedType);
+    return true;
+}
+
+fn bool Analyser.analyseInitListArray(Analyser* ma, InitListExpr* ile, QualType expectedType) {
+    Expr* e = (Expr*)ile;
+    u32 numValues = ile.getNumValues();
+    Expr** values = ile.getValues();
+
+    expectedType.clearQuals();
+    ArrayType* at = expectedType.getArrayType();
+    QualType et = at.getElemType();
+    et.clearQuals();
+
+    bool ok = true;
+    bool ctc = true;
+    bool have_designators = false;
+
+    for (u32 i=0; i<numValues; i++) {
+        Expr* value = values[i];
+
+        if (value.isFieldDesignatedInit()) {
+            ma.errorRange(value.getLoc(), value.getRange(), "field designator cannot initialize an array");
+            ok = false;
+            continue;
+        }
+        if (value.isArrayDesignatedInit()) {
+            ok &= ma.analyseArrayDesignatedInit(value, et, at.isEnumIndex(), at.getIndexType());
+            have_designators = true;
+        } else {
+            ok &= ma.analyseInitExpr(&values[i], et, values[i].getLoc(), false, false);
+        }
+        ctc &= values[i].isCtc();
+    }
+
+    if (ctc) e.setCtc();
+    if (!ok) return false;
+
+    bool has_size = at.hasSize();
+    u32 array_size = at.getSize();
+
+    if (have_designators) {
+        // Check for out of bound array designators or compute implied array length
+        ile.setHasDesignators();
+
+        InitChecker* checker = ma.getInitChecker();
+        ok = ma.checkArrayDesignators(ile, has_size, &array_size, checker);
+        ma.putInitChecker(checker);
+
+        if (!has_size) at.setSize(array_size);
+
+    } else {
+        if (has_size) {
+            if (numValues > array_size) {
+                ma.error(values[array_size].getLoc(), "excess elements in array initializer");
+                return false;
+            }
+        } else {
+            at.setSize(numValues);
+        }
+    }
+
+    e.setType(expectedType);
+    return ok;
+}
+
+fn bool Analyser.checkArrayDesignatorIndex(Analyser* ma, Expr* e, u64 *valp, bool has_size, u64 size)
+{
+    Value idx = ast.evalExpr(e);
+    if (!idx.isInteger()) {
+        ma.errorRange(e.getStartLoc(), e.getRange(), "array designator expression must have integer type");
+        return false;
+    }
+    if (idx.isNegative()) {
+        ma.errorRange(e.getStartLoc(), e.getRange(), "array designator value '%s' is negative", idx.str());
+        return false;
+    }
+    *valp = idx.as_u64();
+    if (has_size && *valp >= size) {
+        ma.errorRange(e.getStartLoc(), e.getRange(), "array designator index '%d' exceeds array upper bound '%d'", *valp, size - 1);
+        return false;
+    }
+    return true;
+}
+
+fn bool Analyser.checkArrayDesignatorLength(Analyser* ma, Expr* e, u64 *valp, bool has_size, u64 size, u64 start_index)
+{
+    SrcLoc loc = e.getStartLoc();
+    Value idx = ast.evalExpr(e);
+    if (!idx.isInteger()) {
+        ma.error(loc, "array slice length expression must have integer type");
+        return false;
+    }
+    // TODO: should check magnitude?
+    if (idx.isNegative() || idx.isZero()) {
+        ma.error(loc, "array slice length must be strictly positive");
+        return false;
+    }
+    u64 len = idx.as_u64();
+    *valp = start_index + len - 1;
+    if (has_size && *valp >= size) {
+        ma.error(loc, "array slice length '%d' exceeds remaining length '%d'", len, size - start_index);
+        return false;
+    }
+    return true;
+}
+
+fn bool Analyser.checkArrayDesignators(Analyser* ma, InitListExpr* ile, bool has_size, u32 *size, InitChecker* checker) {
+    u32 numValues = ile.getNumValues();
+    Expr** values = ile.getValues();
+
+    bool ok = true;
+    u32 max_index = 0;
+    u64 index_hi = u64.max;
+    for (u32 i=0; i<numValues; i++) {
+        Expr* value = values[i];
+        SrcLoc loc = value.getLoc();
+        u64 index_lo = index_hi += 1;
+        if (value.isArrayDesignatedInit()) {
+            ArrayDesignatedInitExpr* ad = (ArrayDesignatedInitExpr*)value;
+            if (ad.hasExpr1()) {
+                if (!ma.checkArrayDesignatorIndex(ad.getExpr1(), &index_lo, has_size, *size))
+                    return false;
+            }
+            index_hi = index_lo;
+            if (ad.getKind() == Slice) {
+                if (ad.hasExpr2()) {
+                    if (!ma.checkArrayDesignatorLength(ad.getExpr2(), &index_hi, has_size, *size, index_lo))
+                        return false;
+                } else {
+                    if (!has_size) {
+                        ma.error(loc, "cannot have an empty slice length in an unsized array");
+                        return false;
+                    }
+                    index_hi = *size - 1;
+                }
+            } else
+            if (ad.getKind() == Range) {
+                if (ad.hasExpr2()) {
+                    if (!ma.checkArrayDesignatorIndex(ad.getExpr2(), &index_hi, has_size, *size))
+                        return false;
+                } else {
+                    if (!has_size) {
+                        ma.error(loc, "cannot have an empty range upper bound in an unsized array");
+                        return false;
+                    }
+                    index_hi = *size - 1;
+                }
+            }
+            if (index_lo > index_hi) {
+                ma.error(loc, "array range designator start '%d' is greater than end '%d'", index_lo, index_hi);
+                return false;
+            }
+            ad.setStart((u32)index_lo);
+            ad.setEnd((u32)index_hi);
+        } else {
+            if (has_size && index_lo >= *size) {
+                ma.error(loc, "excess elements in array initializer");
+                return false;
+            }
+        }
+        if (index_hi >= u32.max) {
+            ma.error(loc, "array index %d is too large", index_hi);
+            return false;
+        }
+        // check for duplicate entries
+        u32 index1, index2;
+        SrcLoc duplicate = checker.find2((u32)index_lo, (u32)index_hi, &index1, &index2);
+        if (duplicate) {
+            if (index1 == index2)
+                ma.error(loc, "duplicate initialization of array index %d", index1);
+            else
+                ma.error(loc, "duplicate initialization of array range %d ... %d", index1, index2);
+            ma.note(duplicate, "previous initialization is here");
+            ok = false;
+        } else {
+            checker.add2((u32)index_lo, (u32)index_hi, loc);
+        }
+        if (index_hi > max_index) max_index = (u32)index_hi;
+    }
+    if (!has_size) *size = max_index + 1;
+    return ok;
+}
+
+type FillInfo struct {
+    FieldInitInfo* fii;
+    u32 member_idx; // virtual index (same for union members)
+    u32 idx;    // index into fields
+}
+
+fn void fillFieldInfo(StructTypeDecl* std, FillInfo* fi, u32 base_offset) {
+    bool isStruct = std.isStruct();
+    Decl** members = std.getMembers();
+    const StructLayout* layout = std.getLayout();
+    const u32 num_members = std.getNumMembers();
+
+    for (u32 i=0; i<num_members; i++) {
+        Decl* d = members[i];
+        FieldInitField* f = &fi.fii.fields[fi.idx];
+        f.member_idx = fi.member_idx;
+        const StructMemberLayout* ml = &layout.members[i];
+
+        u32 member_name = d.getNameIdx();
+        u32 offset = base_offset + ml.offset;
+        if (member_name == 0) {
+            if (d.isStructType()) {
+                StructTypeDecl* sub = (StructTypeDecl*)d;
+                fillFieldInfo(sub, fi, offset);
+            }
+        } else {
+            BitFieldLayout* bit_layout = nil;
+            if (d.isVariable()) {
+                VarDecl* vd = (VarDecl*)d;
+                bit_layout = vd.getBitfieldLayout();
+            }
+            f.name_idx = member_name;
+            f.offset = offset;
+            f.is_bitfield = ml.is_bitfield;
+            f.bitfield_offset = ml.bitfield_offset;
+            f.bitfield_width = ml.bitfield_width;
+            f.bitfield_signed = ml.bitfield_signed;
+            f.decl = members[i];
+            f.bitfield_base_size = (u8)ml.size;
+            if (isStruct) fi.member_idx++; // stays the same for unions
+            fi.idx++;
+        }
+    }
+    if (!isStruct) fi.member_idx++;
+}
+
+fn const FieldInitInfo* Analyser.getFieldInfo(Analyser* ma, StructTypeDecl* std) {
+    if (std.hasFieldInfo()) return std.getFieldInfo();
+
+    FieldInitInfo* fii = ma.builder.actOnFieldInitInfo(std);
+    FillInfo fi = { .fii = fii }
+    fillFieldInfo(std, &fi, 0);
+    fii.num_indexes = fi.member_idx + 1;
+
+#if 0
+    std.asDecl().dump();
+    printf("FIELDS (%d / %d)\n", fii.num_fields, fii.num_indexes);
+    for (u32 i=0; i<fii.num_fields; i++) {
+        const FieldInitField* fif = &fii.fields[i];
+        printf("  [%2d] %8s  %2d  %2d\n", i, ma.idx2name(fif.name_idx), fif.offset, fif.member_idx);
+    }
+#endif
+    return fii;
+}
+
+fn bool Analyser.analyseStructFieldInit(Analyser* ma, StructTypeDecl* std, InitListExpr* ile, QualType expectedType) {
+    ile.setHasDesignators();
+
+    const FieldInitInfo* fii = ma.getFieldInfo(std);
+    // TODO get from global stack, dont allocate+free
+    StructFieldInitChecker checker.init(fii.num_indexes);
+    bool ctc = true;
+
+    u32 numValues = ile.getNumValues();
+    Expr** values = ile.getValues();
+    for (u32 i=0; i<numValues; i++) {
+        Expr* value = values[i];
+        if (value.isArrayDesignatedInit()) {
+            ma.error(value.getLoc(), "array designator cannot initialize non-array type '%s'", expectedType.diagName());
+            goto out;
+        }
+        if (!value.isFieldDesignatedInit()) {
+            ma.error(value.getLoc(), "mixing field designators with non-field designators");
+            goto out;
+        }
+
+        FieldDesignatedInitExpr* fdi = (FieldDesignatedInitExpr*)value;
+        u32 field_name = fdi.getField();
+
+        const FieldInitField* fif = fii.find(field_name);
+        if (!fif) {
+            ma.memberError(field_name, value.getLoc(), std);
+            goto out;
+        }
+        Decl* member = fif.decl;
+
+        fdi.setMemberInfo(fif);
+        //member.setUsed(); // dont set member used just by being initialized
+
+        SrcLoc prev = checker.add(fif.member_idx, value.getLoc());
+        if (prev) {
+            ma.error(value.getLoc(), "duplicate initialization of field '%s'", fdi.getFieldName());
+            ma.note(prev, "previous initialization is here");
+            goto out;
+        }
+
+        bool ok = ma.analyseInitExpr(fdi.getInit2(), member.getType(), fdi.getInit().getLoc(), fif.is_bitfield, false);
+        if (!ok) goto out;
+
+        Expr* inner = fdi.getInit();
+        ctc &= inner.isCtc();
+        value.setType(inner.getType());
+        if (fif.is_bitfield && inner.isCtv()) {
+            if (!ctv_analyser.checkBitfield(ma.diags, fif.bitfield_width, fif.bitfield_signed, inner)) goto out;
+        }
+    }
+
+    expectedType.clearQuals();
+    Expr* e = (Expr*)ile;
+    if (ctc) e.setCtc();
+    e.setType(expectedType);
+    checker.free();
+    return true;
+out:
+    checker.free();
+    return false;
+}
+
+fn bool Analyser.analyseInitListStruct(Analyser* ma, InitListExpr* ile, QualType expectedType) {
+    // Note: expectedType is StructType
+    Expr* e = (Expr*)ile;
+    u32 numValues = ile.getNumValues();
+    Expr** values = ile.getValues();
+
+    StructType* st = expectedType.getStructType();
+    StructTypeDecl* std = st.getDecl();
+
+    // just init all values to 0
+    if (numValues == 0) {
+        e.setType(expectedType);
+        e.setCtc();
+        return true;
+    }
+
+    // only allow none or all fields to use Designators
+    const bool haveDesignators = values[0].isFieldDesignatedInit();
+
+    if (!haveDesignators && std.isUnion()) {
+        ma.error(values[0].getLoc(), "union member initializer needs field designator");
+        return false;
+    }
+
+    if (haveDesignators) {
+        return ma.analyseStructFieldInit(std, ile, expectedType);
+    }
+
+    bool ctc = true;
+    const u32 num_members = std.getNumMembers();
+    Decl** members = std.getMembers();
+
+    const StructLayout* layout = std.getLayout();
+    u32 member_idx = 0;
+    for (u32 i=0; i<numValues; i++) {
+        Expr* value = values[i];
+
+        // skip bitfields with size 0
+        while (member_idx < num_members && layout.members[member_idx].is_bitfield && layout.members[member_idx].bitfield_width == 0) {
+            member_idx++;
+        }
+
+        if (member_idx >= num_members) {
+            ma.error(value.getLoc(), "excess initializer elements in struct");
+            return false;
+        }
+        const StructMemberLayout* ml = &layout.members[member_idx];
+        if (value.isArrayDesignatedInit()) {
+            ma.error(value.getLoc(), "array designator cannot initialize non-array type '%s'", expectedType.diagName());
+            return false;
+        }
+        if (value.isFieldDesignatedInit()) {
+            ma.error(value.getLoc(), "mixing field designators with non-field designators");
+            return false;
+        }
+        members[member_idx].setUsed();
+
+        bool ok = ma.analyseInitExpr(&values[i], members[member_idx].getType(), values[i].getLoc(), ml.is_bitfield, false);
+        if (!ok) return false;
+
+        if (ml.is_bitfield && value.isCtv()) {
+            if (!ctv_analyser.checkBitfield(ma.diags, ml.bitfield_width, ml.bitfield_signed, value)) return false;
+        }
+
+        ctc &= value.isCtc();
+        member_idx++;
+    }
+
+    if (ctc) e.setCtc();
+    expectedType.clearQuals();
+    e.setType(expectedType);
+    return true;
+}
+

@@ -1,0 +1,52 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module file_copy;
+
+import file_buffer { FileBuffer }
+import file_utils { Pathname }
+
+public fn bool copy_file(const char* source, const char* dest, i32* errp) {
+    // Note: not most optimal yet
+
+    // create required sub-directories in dest
+    Pathname tmp.init(dest);
+    if (tmp.error) {
+        *errp = tmp.error;
+        return false;
+    }
+
+    const char* base = tmp.get_basename();
+    if (base != tmp.path) {
+        u32 len = (u32)(base - tmp.path);
+        tmp.path[len-1] = '\0';
+        if (tmp.create_path()) {
+            *errp = tmp.error;
+            return false;
+        }
+    }
+
+    // copy file
+    FileBuffer fbuf.init();
+
+    // TODO just open both and copy page-by-page (dont use reader/writer)
+    if (!fbuf.loadFile(source) || !fbuf.writeFile(dest)) {
+        *errp = fbuf.error;
+        fbuf.deinit();
+        return false;
+    }
+    fbuf.deinit();
+    return true;
+}

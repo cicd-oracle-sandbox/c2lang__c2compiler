@@ -1,0 +1,70 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type StaticAssert struct @(opaque) {
+    Stmt base;
+    u32 ast_idx;    // into globals.ast_list, 0 means nil
+    Expr* lhs;
+    Expr* rhs;
+}
+
+public fn StaticAssert* StaticAssert.create(Context* c,
+                                            u32 ast_idx,
+                                            SrcLoc loc,
+                                            Expr* lhs,
+                                            Expr* rhs)
+{
+    StaticAssert* d = c.alloc(sizeof(StaticAssert));
+    d.base.init(StaticAssert, loc);
+    d.ast_idx = ast_idx;
+    d.lhs = lhs;
+    d.rhs = rhs;
+#if AstStatistics
+    Stats.addStmt(StaticAssert, sizeof(StaticAssert));
+#endif
+    return d;
+}
+
+fn Stmt* StaticAssert.instantiate(StaticAssert* s, Instantiator* inst) {
+    return (Stmt*)StaticAssert.create(inst.c, s.ast_idx, s.base.loc,
+                                      s.lhs.instantiate(inst),
+                                      s.rhs ? s.rhs.instantiate(inst) : nil);
+}
+
+public fn AST* StaticAssert.getAST(const StaticAssert* d) {
+    return globals.idx2ast(d.ast_idx);
+}
+
+public fn Expr* StaticAssert.getLHS(const StaticAssert* d) {
+    return d.lhs;
+}
+
+public fn Expr* StaticAssert.getRHS(const StaticAssert* d) {
+    return d.rhs;
+}
+
+fn void StaticAssert.print(const StaticAssert* d, StringBuf* out, u32 indent) {
+    d.base.printKind(out, indent);
+    out.newline();
+    d.lhs.print(out, indent + 1);
+    if (d.rhs) d.rhs.print(out, indent + 1);
+}
+

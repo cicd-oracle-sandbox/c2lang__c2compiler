@@ -1,0 +1,78 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module plugin_info;
+
+import ast;
+import ast_builder { Builder }
+import ast_context { Context }
+import build_target { BuildTarget }
+import component { ComponentList }
+import console;
+import diagnostics { Diags }
+import file_utils { Max_path }
+import source_mgr { SourceMgr }
+import string_pool { StringPool }
+import string_buffer { StringBuf }
+
+public type RegisterAttrFn fn bool (void* arg, u32 name, ast.AttrHandlerFn func, void* arg2);
+
+public type AddSourceFn fn void (void* arg, const char* name, StringBuf* content);
+
+public type Info struct {
+    SourceMgr* sm;    // no ownership
+    Diags* diags;    // no ownership
+    BuildTarget* target;
+
+    ComponentList* components;
+    StringPool* astPool;
+    StringPool* auxPool;
+    Context* context;
+    Builder* builder;
+    ast.Globals* ast_globals;
+    void* ast_builtins__;  // part of ast_globals now
+
+    AddSourceFn addSource;
+    RegisterAttrFn register_attr;
+    void* fn_arg;
+
+    char[32] target_name;
+    char[Max_path] output_dir;
+}
+
+// only used by plugins
+public fn bool Info.registerAttr(Info* info,
+                                 u32 name,
+                                 ast.AttrHandlerFn func,
+                                 void* arg) @(unused) {
+    return info.register_attr(info.fn_arg, name, func, arg);
+}
+
+/*
+    Allowed actions:
+    init            add generated sources (shell_cmd plugin)
+    post_parse      add modules + decls (git_version plugin)
+                    add generated sources (unit_test plugin)
+    post analysis   generate files outside project (refs, deps)
+*/
+public type Plugin struct @(unused) {
+    fn void*(const char* options, console.Config* config) load;
+    fn void(void* arg) unload;
+    fn void(void* arg, plugin_info.Info* info) init;
+    fn void(void* arg) post_parse;
+    fn void(void* arg) post_analysis;
+    const char* name;
+}
+

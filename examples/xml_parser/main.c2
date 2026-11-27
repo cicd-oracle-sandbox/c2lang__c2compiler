@@ -1,0 +1,68 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module test;
+
+import file_buffer { FileBuffer }
+import xml;
+
+import stdio { fprintf, printf, stderr }
+
+public fn i32 main(i32 argc, char** argv) {
+    if (argc != 2 && argc != 3) {
+        fprintf(stderr, "usage: xml_parser [xml-file] <verbose>\n");
+        return 2;
+    }
+    const char* filename = argv[1];
+    bool verbose = (argc == 3);
+    printf("parsing %s\n", filename);
+    FileBuffer file.init();
+    if (!file.loadFile(filename)) {
+        fprintf(stderr, "cannot read %s: %s\n", filename, file.getError());
+        file.deinit();
+        return 1;
+    }
+
+    if (file.isEmpty()) {
+        printf("file %s is empty\n", filename);
+        file.deinit();
+        return 0;
+    }
+
+    xml.Parser parser;
+    if (!parser.parse(file.data(), verbose)) {
+        printf("error parsing %s: %s\n", filename, parser.getDiag());
+    }
+
+    xml.Node2 root = parser.getRoot();
+
+    printf("root = %s\n", root.getName());
+    const char* name = root.getAttr("name");
+    if (name) printf("  name = %s\n", name);
+
+    // iterate all children
+    xml.NodeIter iter = root.getIter();
+    while (!iter.done()) {
+        xml.Node2 child = iter.get();
+        printf("  child %s\n", child.getName());
+        iter.next();
+    }
+
+    parser.destroy();
+    file.deinit();
+
+    return 0;
+}
+

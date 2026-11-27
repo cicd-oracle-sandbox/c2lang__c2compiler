@@ -1,0 +1,28 @@
+// @recipe bin
+    $warnings no-unused
+    $backend c
+
+// @file{file1}
+module test;
+
+type D B[10];
+type C A[10];
+type B A;
+
+type A struct {
+    i32 x;
+}
+
+// @expect{atleast, cgen/build.c}
+
+typedef struct test_A_ test_A;
+
+typedef test_A test_B;
+typedef test_A test_D[10];
+typedef test_A test_C[10];
+
+struct test_A_ {
+  int x;
+};
+
+

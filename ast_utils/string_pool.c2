@@ -1,0 +1,261 @@
+/* Copyright 2022-2026 Bas van den Berg, Charlie Gordon
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module string_pool;
+
+import stdio { printf }
+import stdlib { calloc, malloc, realloc, free }
+import string { memcpy, strlen }
+
+#if 1
+/* 32-bit pools can store up to 32K unique string for a combined length of 512KB */
+type HashEntry u32;
+const u32 NEXT_SHIFT = 17;
+const u32 INDEX_BITS = (1 << NEXT_SHIFT) - 1;
+const u32 INDEX_SHIFT = 2;
+const u32 DATA_ALIGN = 1 << INDEX_SHIFT;
+#else
+/* 64-bit pools can store up to 4G unique string for a combined length of 4GB */
+type HashEntry u64;
+const u32 NEXT_SHIFT = 32;
+const u64 INDEX_BITS = 0xffffffff;
+const u32 INDEX_SHIFT = 0;
+const u32 DATA_ALIGN = 1 << INDEX_SHIFT;
+#endif
+const u32 BLOCK_SIZE = 16384;
+
+type Block struct {
+    u32 size;
+    u32 capacity;
+    char* data;
+}
+
+public type StringPool struct @(opaque) {
+    u32 blocks_count;
+    u32 blocks_capacity;
+    Block* blocks;
+
+    // statistics
+    u32 num_adds;       // number of adds including filtered ones
+    u32 total_size;     // total size that would have been allocated without filtering
+    u32 num_strs;       // number of strings allocated
+    u32 data_size;      // number of bytes used in all blocks
+    u32 data_capacity;  // total size allocated
+    u32 pad;
+
+    // Hashtable
+    u32 hash_count;
+    u32 hash_mask;
+    u32 entry_size;     // index of the first available entry after hash table
+    u32 entry_capacity;
+    HashEntry* entries; // contain hash table followed by collision lists
+}
+static_assert(64, sizeof(StringPool));
+
+public fn StringPool* StringPool.create(u32 data_capacity, u32 hash_size) {
+    StringPool* p = calloc(1, sizeof(StringPool));
+
+    // initialize internal block directory
+    // data_capacity is ignored because we the initial block cannot be
+    // larger than BLOCK_SIZE otherwise offsets could too large
+    data_capacity = BLOCK_SIZE;
+    Block* bp = malloc(4 * sizeof(Block));
+    p.blocks = bp;
+    p.blocks_capacity = 4;
+    p.blocks_count = 1;
+    bp.data = malloc(data_capacity);
+    bp.data[0] = 0; // empty string at index 0
+    bp.size = DATA_ALIGN;
+    bp.capacity = data_capacity;
+
+    // initial stats
+    p.data_size = DATA_ALIGN;
+    p.data_capacity = data_capacity;
+
+    // round hash_size to the next power of 2, at least 256
+    while (hash_size & (hash_size - 1)) hash_size = (hash_size | (hash_size - 1)) + 1;
+    if (hash_size < 256) hash_size = 256;
+
+    // allocate empty hash table with extra space for collision lists
+    p.hash_mask = hash_size - 1;
+    p.entry_size = hash_size;
+    p.entry_capacity = hash_size * 2;
+    p.entries = calloc(p.entry_capacity, sizeof(HashEntry));
+
+    return p;
+}
+
+public fn void StringPool.free(StringPool* p) {
+    free(p.entries);
+    while (p.blocks_count) free(p.blocks[--p.blocks_count].data);
+    free(p.blocks);
+    free(p);
+}
+
+const u32 HASH_INITIAL = 13;
+const u32 HASH_PRIME = 17;
+
+fn u32 StringPool.hash(const char* text, usize len) {
+    // FNV-1a hash
+    u32 result = HASH_INITIAL;
+    for (u32 i=0; i<len; i++) {
+        result = result ^ text[i];
+        result *= HASH_PRIME;
+    }
+    return result;
+}
+
+public fn const char* StringPool.idx2str(const StringPool* p, u32 idx) {
+    return p.blocks[idx / BLOCK_SIZE].data + idx % BLOCK_SIZE;
+}
+
+// NOTE: right might NOT be 0-terminated!
+fn bool StringPool.same_string(const char* left, const char* right, usize rlen) {
+    // cannot use memcmp because rlen bytes might not be accessible from left
+    for (u32 i = 0; i < rlen; i++) {
+        if (left[i] != right[i])
+            return false;
+    }
+    return (left[rlen] == '\0');
+}
+
+// NOTE: text is not 0-terminated!! len is strlen(text)
+public fn u32 StringPool.add(StringPool* p, const char* text, usize len, bool filter) {
+    // TODO compute the number of duplicates?
+    p.num_adds++;
+    p.total_size += len + 1;
+
+    HashEntry hh;
+    HashEntry* hp = &hh;
+    if (filter) {
+        usize h = StringPool.hash(text, len) & p.hash_mask;
+        HashEntry v = p.entries[h];
+        if (v != 0) {
+            HashEntry next;
+            /* scan the list */
+            for (;;) {
+                u32 index = (v & INDEX_BITS) << INDEX_SHIFT;
+                if (StringPool.same_string(p.idx2str(index), text, len))
+                    return index;
+                next = v >> NEXT_SHIFT;
+                if (next == 0)
+                    break;
+                h = next;
+                v = p.entries[h];
+            }
+            next = p.entry_size;
+            if (next == p.entry_capacity) {
+                p.resize_entries(p.entry_capacity * 2);
+            }
+            p.entries[h] = v | (next << NEXT_SHIFT);
+            p.entry_size++;
+            h = next;
+        }
+        hp = &p.entries[h];
+        p.hash_count++;
+    }
+
+    p.num_strs++;
+    p.data_size += len + 1;
+
+    // try the current block
+    u32 b = p.blocks_count - 1;
+    Block* bp = &p.blocks[b];
+    if (bp.size + len < bp.capacity) goto has_bp;
+
+    // try and complete a previous block
+    while (b-- > 0) {
+        bp--;
+        if (bp.size + len < bp.capacity) goto has_bp;
+    }
+    // allocate a new block
+    if (p.blocks_count == p.blocks_capacity) {
+        // extend block directory
+        p.blocks_capacity *= 2;
+        p.blocks = realloc(p.blocks, p.blocks_capacity * sizeof(*p.blocks));
+    }
+    b = p.blocks_count++;
+    bp = &p.blocks[b];
+    u32 block_size = BLOCK_SIZE;
+    if (len >= BLOCK_SIZE) block_size = (u32)len / DATA_ALIGN * DATA_ALIGN + DATA_ALIGN;
+    p.data_capacity += block_size;
+    bp.data = malloc(block_size);
+    bp.size = 0;
+    bp.capacity = block_size;
+has_bp:
+    u32 idx = b * BLOCK_SIZE + bp.size;
+    char* dest = bp.data + bp.size;
+    memcpy(dest, text, len);
+    dest[len] = 0;
+    bp.size += (u32)len / DATA_ALIGN * DATA_ALIGN + DATA_ALIGN;
+    *hp = (idx >> INDEX_SHIFT);
+    return idx;
+}
+
+public fn u32 StringPool.addStr(StringPool* p, const char* text, bool filter) {
+    return p.add(text, strlen(text), filter);
+}
+
+fn void StringPool.resize_entries(StringPool* p, u32 capacity) {
+    p.entries = realloc(p.entries, capacity * sizeof(*p.entries));
+    p.entry_capacity = capacity;
+}
+
+public fn void StringPool.report(const StringPool* p, const char* name) @(unused) {
+    // compute bucket lengths
+    u32 max = 0;
+    u32 min = 999;
+    u32 hash_size = p.hash_mask + 1;
+    u32 count = 0;
+    u32[256] cc = {}
+    for (u32 i = 0; i < hash_size; i++) {
+        HashEntry v = p.entries[i];
+        if (v != 0) {
+            u32 num = 1;
+            while (v >> NEXT_SHIFT) {
+                num++;
+                v = p.entries[v >> NEXT_SHIFT];
+            }
+            count += num;
+            if (num < 256) cc[num]++;
+            if (num > max) max = num;
+            if (num < min) min = num;
+            //printf("[%4d] %d\n", i, num);
+        }
+    }
+    printf("%s: count %d/%d, adds %d/%d, data %d/%d\n",
+                 name, p.hash_count, p.num_strs, p.num_adds, p.total_size,
+                 p.data_size, p.data_capacity);
+    printf("  hash: entries: %d/%d/%d/%d, min %d, max %d, avg %.2f, memory %d\n",
+                 hash_size, count, p.entry_size, p.entry_capacity,
+                 min, max, count ? (count + 0.0) / (hash_size - cc[0]) : 0.0,
+                 p.entry_capacity * sizeof(HashEntry));
+    printf("  buckets: %d", cc[0]);
+    for (u32 i = 1; i <= max; i++)
+        printf(", %d", cc[i]);
+    printf("\n");
+
+#if 0
+    for (u32 b = 0; b < p.blocks_count; b++) {
+        Block* bp = p.blocks[b];
+        for (u32 idx = 0; idx < bp.size; idx = idx / DATA_ALIGN * DATA_ALIGN + DATA_ALIGN) {
+            const char* cp = bp.data + idx;
+            printf("  [%5u] %s\n", b * BLOCK_SIZE + idx, cp);
+            idx += strlen(cp);
+        }
+    }
+#endif
+}
+

@@ -1,0 +1,274 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ast;
+
+import ast_context { Context }
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+
+public type BuiltinExprKind enum u8 (const char* const name) {
+    Sizeof      : { "sizeof" },
+    Countof     : { "countof" },
+    OffsetOf    : { "offsetof" },
+    ToContainer : { "to_container" },
+    VaArg       : { "va_arg" },
+}
+
+type BuiltinExprBits struct @(packed) {
+    u32 : NumExprBits;
+    BuiltinExprKind kind : 3;
+    // TODO: builtin expressions should be output literally in the
+    //   C generator except countof(enum) that cannot be expressed in C.
+    //   use_literal is tested in the C generator but not set yet.
+    bool use_literal : 1;
+    u32 src_len : 32 - NumExprBits - 4; // length of () expression
+}
+static_assert(4, sizeof(BuiltinExprBits));
+
+type ToContainerData struct {
+    Expr* member;
+    Expr* pointer;
+}
+
+type OffsetOfData struct {
+    Expr* member;       // Identifier / MemberExpr
+}
+
+type VaArgData struct {
+    QualType dest_type;  // set during analysis, can differ from expr.qt
+    TypeRef dest;    // note: variable length!
+}
+
+public type BuiltinExpr struct @(opaque) {
+    Expr base;
+    // TODO use TypeRef (can contain Type or VarDecl ref)
+    Expr* inner;
+    u64 value;
+    union {
+        OffsetOfData[] offset;     // tail-allocated, only for offsetof
+        ToContainerData[] container;   // tail-allocated, only for to_container
+        VaArgData[] va_arg_data;
+    }
+}
+
+public fn BuiltinExpr* BuiltinExpr.create(Context* c, SrcLoc loc, u32 src_len, Expr* inner, BuiltinExprKind kind) {
+    const u32 size = sizeof(BuiltinExpr);
+    BuiltinExpr* e = c.alloc(size);
+    e.base.init(Builtin, loc, true, true, false, RValue);
+    e.base.base.builtinExprBits.kind = kind;
+    e.base.base.builtinExprBits.src_len = src_len;
+    e.inner = inner;
+    e.value = 0;
+#if AstStatistics
+    Stats.addExpr(Builtin, size);
+#endif
+    return e;
+}
+
+public fn BuiltinExpr* BuiltinExpr.createOffsetOf(Context* c, SrcLoc loc, u32 src_len, Expr* typeExpr, Expr* member) {
+    const u32 size = sizeof(BuiltinExpr) + sizeof(OffsetOfData);
+    BuiltinExpr* e = c.alloc(size);
+    e.base.init(Builtin, loc, true, true, false, RValue);
+    e.base.base.builtinExprBits.kind = OffsetOf;
+    e.base.base.builtinExprBits.src_len = src_len;
+    e.inner = typeExpr;
+    e.value = 0;
+    e.offset[0].member = member;
+#if AstStatistics
+    Stats.addExpr(Builtin, size);
+#endif
+    return e;
+}
+
+public fn BuiltinExpr* BuiltinExpr.createToContainer(Context* c, SrcLoc loc, u32 src_len, Expr* typeExpr, Expr* member, Expr* pointer) {
+    const u32 size = sizeof(BuiltinExpr) + sizeof(ToContainerData);
+    BuiltinExpr* e = c.alloc(size);
+    e.base.init(Builtin, loc, false, false, false, RValue);
+    e.base.base.builtinExprBits.kind = ToContainer;
+    e.base.base.builtinExprBits.src_len = src_len;
+    e.inner = typeExpr;
+    e.value = 0;
+    e.container[0].member = member;
+    e.container[0].pointer = pointer;
+#if AstStatistics
+    Stats.addExpr(Builtin, size);
+#endif
+    return e;
+}
+
+public fn BuiltinExpr* BuiltinExpr.createVaArg(Context* c, SrcLoc loc, u32 src_len, const TypeRefHolder* ref, Expr* inner)
+{
+    const u32 size = sizeof(BuiltinExpr) + sizeof(VaArgData) + ref.getExtraSize();
+    BuiltinExpr* e = c.alloc(size);
+    e.base.init(Builtin, loc, false, false, true, RValue);
+    e.base.base.builtinExprBits.kind = VaArg;
+    e.base.base.builtinExprBits.src_len = src_len;
+    e.inner = inner;
+    e.value = 0;
+    e.va_arg_data[0].dest_type = QualType_Invalid;
+    e.va_arg_data[0].dest.init(ref);
+#if AstStatistics
+    Stats.addExpr(Builtin, size);
+#endif
+    return e;
+}
+
+fn Expr* BuiltinExpr.instantiate(BuiltinExpr* e, Instantiator* inst) {
+    switch (e.getKind()) {
+    case Sizeof:
+    case Countof:
+        return (Expr*)BuiltinExpr.create(inst.c, e.base.base.loc, e.base.base.builtinExprBits.src_len,
+                                         e.inner.instantiate(inst), e.getKind());
+    case OffsetOf:
+        return (Expr*)BuiltinExpr.createOffsetOf(inst.c, e.base.base.loc, e.base.base.builtinExprBits.src_len,
+                                                 e.inner.instantiate(inst),
+                                                 e.offset[0].member.instantiate(inst));
+    case ToContainer:
+        return (Expr*)BuiltinExpr.createToContainer(inst.c, e.base.base.loc, e.base.base.builtinExprBits.src_len,
+                                                    e.inner.instantiate(inst),
+                                                    e.container[0].member.instantiate(inst),
+                                                    e.container[0].pointer.instantiate(inst));
+    case VaArg:
+        bool matches = e.va_arg_data[0].dest.matchesTemplate(inst.template_name);
+        u32 extra = matches ? inst.ref.getExtraSize() : e.va_arg_data[0].dest.getExtraSize();
+        u32 size = sizeof(BuiltinExpr) + sizeof(VaArgData) + extra;
+        BuiltinExpr* e2 = inst.c.alloc(size);
+        e2.base = e.base;
+        e2.inner = e.inner.instantiate(inst);
+        e2.value = 0;
+        e2.va_arg_data[0].dest_type = QualType_Invalid;
+        e2.va_arg_data[0].dest.instantiate(&e.va_arg_data[0].dest, inst);
+#if AstStatistics
+        Stats.addExpr(Builtin, size);
+#endif
+        return (Expr*)e2;
+    }
+    return nil;
+}
+
+public fn BuiltinExprKind BuiltinExpr.getKind(const BuiltinExpr* e) {
+    return e.base.base.builtinExprBits.kind;
+}
+
+public fn u64 BuiltinExpr.useLiteral(const BuiltinExpr* e) {
+    return e.base.base.builtinExprBits.use_literal;
+}
+
+public fn u64 BuiltinExpr.getValue(const BuiltinExpr* e) { return e.value; }
+
+public fn void BuiltinExpr.setValue(BuiltinExpr* e, u64 val) {
+    e.value = val;
+}
+
+public fn Expr** BuiltinExpr.getInner2(BuiltinExpr* e) { return &e.inner; }
+public fn Expr* BuiltinExpr.getInner(const BuiltinExpr* e) { return e.inner; }
+
+fn SrcLoc BuiltinExpr.getEndLoc(const BuiltinExpr* e) {
+    return e.base.base.loc + e.base.base.builtinExprBits.src_len;
+}
+
+public fn Expr* BuiltinExpr.getOffsetOfMember(const BuiltinExpr* b) {
+    assert(b.getKind() == OffsetOf);
+    return b.offset[0].member;
+}
+
+public fn Expr* BuiltinExpr.getToContainerMember(const BuiltinExpr* b) {
+    assert(b.getKind() == ToContainer);
+    return b.container[0].member;
+}
+
+public fn Expr* BuiltinExpr.getToContainerPointer(const BuiltinExpr* b) {
+    assert(b.getKind() == ToContainer);
+    return b.container[0].pointer;
+}
+
+public fn Expr** BuiltinExpr.getToContainerPointer2(BuiltinExpr* b) {
+    assert(b.getKind() == ToContainer);
+    return &b.container[0].pointer;
+}
+
+public fn void BuiltinExpr.setVaArgDestType(BuiltinExpr* b, QualType qt) {
+    assert(b.getKind() == VaArg);
+    b.va_arg_data[0].dest_type = qt;
+}
+public fn QualType BuiltinExpr.getVaArgDestType(const BuiltinExpr* b) {
+    assert(b.getKind() == VaArg);
+    return b.va_arg_data[0].dest_type;
+}
+
+public fn TypeRef* BuiltinExpr.getVaArgTypeRef(BuiltinExpr* b) {
+    assert(b.getKind() == VaArg);
+    return &b.va_arg_data[0].dest;
+}
+
+fn void BuiltinExpr.print(const BuiltinExpr* e, StringBuf* out, u32 indent) {
+    e.base.printKind(out, indent);
+    e.base.printTypeBits(out);
+    out.color(col_Value);
+    out.print(" %s", e.getKind().name);
+    out.color(col_Calc);
+    out.print(" %d", e.value);
+    out.newline();
+
+    e.inner.print(out, indent + 1);
+
+    switch (e.getKind()) {
+    case Sizeof:
+    case Countof:
+        break;
+    case OffsetOf:
+        e.offset[0].member.print(out, indent + 1);
+        break;
+    case ToContainer:
+        e.container[0].member.print(out, indent + 1);
+        e.container[0].pointer.print(out, indent + 1);
+        break;
+    case VaArg:
+        if (e.va_arg_data[0].dest_type.isValid()) {
+            e.va_arg_data[0].dest_type.printQuoted(out);
+        } else {
+            e.va_arg_data[0].dest.print(out, true);
+        }
+        break;
+    }
+}
+
+fn void BuiltinExpr.printLiteral(const BuiltinExpr* e, StringBuf* out) {
+    out.add(e.getKind().name);
+    out.lparen();
+    e.inner.printLiteral(out);
+    switch (e.getKind()) {
+    case Sizeof:
+    case Countof:
+        break;
+    case OffsetOf:
+        out.add(", ");
+        e.offset[0].member.printLiteral(out);
+        break;
+    case ToContainer:
+        out.add(", ");
+        e.container[0].member.printLiteral(out);
+        out.add(", ");
+        e.container[0].pointer.printLiteral(out);
+        break;
+    case VaArg:
+        out.add(", ");
+        e.va_arg_data[0].dest.print(out, true);
+        break;
+    }
+    out.rparen();
+}
+

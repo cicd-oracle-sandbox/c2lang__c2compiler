@@ -1,0 +1,673 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module conversion_checker;
+
+import ast { * }
+import ast_builder { Builder }
+import diagnostics { Diags }
+import ctv_analyser { checkRange }
+import src_loc { SrcLoc }
+
+//  0 = cannot happen (mostly Module/Alias type)
+//  1 = Not allowed
+//  2 = Builtin -> Builtin
+//  3 = Builtin -> Pointer (only usize/u64/u32 -> void*)
+//  4 = Pointer -> Builtin (only void* -> usize/u64/u32)
+//  5 = Pointer -> Pointer
+//  6 = Pointer -> Func (void* or Func*)
+//  7 = Array -> Pointer
+//  8 = Array -> Array
+//  9 = Struct -> Struct
+// 10 = Enum -> Builtin (check range)
+// 11 = Func -> Pointer (void* or Func*)
+// 12 = Func -> Func
+// 13 = Builtin -> Enum
+// 14 = Enum -> Enum
+// 15 = Builtin -> Func
+// 16 = Func -> Builtin
+// 17 = Anything -> Void
+const u8[TypeKind][TypeKind] Conversions = {
+    //  Builtin Pointer Array   Struct  Enum    Func   Void     Alias    Module
+    //  Builtin ->
+    {   2,      3,      1,      1,     13,     15,     17,     0,      0   },
+    //  Pointer ->
+    {   4,      5,      1,      1,      1,      6,     17,     0,      0   },
+    //  Array ->
+    {   1,      7,      8,      1,      1,      1,     17,     0,      0   },
+    //  Struct ->
+    {   1,      1,      1,      9,      1,      1,     17,     0,      0   },
+    //  Enum ->
+    {   10,     1,      1,      1,     14,      1,     17,     0,      0   },
+    //  Function ->
+    {   16,     11,     1,      1,      1,      12,    17,     0,      0   },
+    //  Void += / -=
+    {   1,      1,      1,      1,      1,      1,     17,     0,      0   },
+    //  Alias ->
+    {   0,      0,      0,      0,      0,      0,      0,     0,      0   },
+    //  Module ->
+    {   0,      0,      0,      0,      0,      0,      0,     0,      0   },
+}
+
+//  0 = should not happen? (same)
+//  1 = ok, but needs conversion
+//  2 = incompatible
+//  3 = sign-conversion
+//  4 = loss of integer-precision
+//  5 = float -> integer
+//  6 = loss of FP-precision
+//  7 = ok, no conversion needed (eg. char -> u8, isize -> i64, i32 -> bool)
+// No need to adjust for 32-bit as ISize and USize are converted before the lookup
+const u8[BuiltinKind][BuiltinKind] BuiltinConversions = {
+    //  Bool   Char   Int8   Int16  Int32  Int64  UInt8  UInt16 UInt32 UInt64 Flt32  Flt64  ISize  USize
+    // Bool ->
+    {   0,     1,     1,     1,     1,     1,     1,     1,     1,     1,     1,     1,     1,     1  },
+    // Char ->
+    {   7,     0,     3,     1,     1,     1,     7,     1,     1,     1,     1,     1,     1,     1  },
+    // Int8 ->
+    {   7,     3,     0,     1,     1,     1,     3,     3,     3,     3,     1,     1,     1,     3  },
+    // Int16 ->
+    {   7,     4,     4,     0,     1,     1,     4,     3,     3,     3,     1,     1,     1,     3  },
+    // Int32 ->
+    {   7,     4,     4,     4,     7,     1,     4,     4,     3,     3,     1,     1,     1,     3  },
+    // Int64 ->
+    {   7,     4,     4,     4,     4,     7,     4,     4,     4,     3,     1,     1,     7,     3  },
+    // UInt8 ->
+    {   7,     1,     3,     1,     1,     1,     0,     1,     1,     1,     1,     1,     3,     1  },
+    // UInt16 ->
+    {   7,     4,     4,     3,     1,     1,     4,     0,     1,     1,     1,     1,     3,     1  },
+    // UInt32 ->
+    {   7,     4,     4,     4,     3,     1,     4,     4,     7,     1,     1,     1,     3,     1  },
+    // UInt64 ->
+    {   7,     4,     4,     4,     4,     3,     4,     4,     4,     7,     1,     1,     3,     7  },
+    // Flt32 ->
+    {   2,     5,     5,     5,     5,     5,     5,     5,     5,     5,     0,     1,     5,     5  },
+    // Flt64 ->
+    {   2,     5,     5,     5,     5,     5,     5,     5,     5,     5,     6,     0,     5,     5  },
+    // ISize ->
+    {   7,     4,     4,     4,     4,     7,     4,     4,     4,     3,     1,     1,     0,     3  },
+    // USize ->
+    {   7,     4,     4,     4,     4,     3,     4,     4,     4,     7,     1,     1,     3,     0  },
+}
+
+public type Checker struct {
+    Diags* diags;
+    Builder* builder;
+    BuiltinKind native_kind;
+
+    // changes every check
+    SrcLoc loc;
+    QualType lhs;
+    QualType rhs;
+    Expr** expr_ptr;
+}
+
+public fn void Checker.init(Checker* c, Diags* diags, Builder* builder) {
+    c.diags = diags;
+    c.builder = builder;
+    c.native_kind = builder.getNativeKind();
+    // leave other fields uninitialized
+}
+
+fn bool Checker.conversionError(Checker* c, const char* msg) {
+    c.diags.error(c.loc, "%s '%s' to '%s'", msg, c.rhs.diagName(), c.lhs.diagName());
+    return false;
+}
+
+fn bool Checker.shouldNotHappen(Checker* c, const char* from @(auto_func),
+                                const Type* lcanon, const Type* rcanon, u8 res)
+{
+    c.diags.error(c.loc, "%s: SHOULD NOT HAPPEN (%s -> %s, res=%d)\n",
+                  from, rcanon.getKind().name, lcanon.getKind().name, res);
+    c.lhs.dump_full();
+    c.rhs.dump_full();
+    assert(0);
+    return false;
+}
+
+public fn bool Checker.checkAssign(Checker* c, QualType lhs, QualType rhs, Expr** e_ptr, SrcLoc loc) {
+    assert(lhs.ptr);
+    assert(rhs.ptr);
+    assert(!(*e_ptr).isNValue());
+
+    QualType t1 = lhs.getCanonicalType();
+    QualType t2 = rhs.getCanonicalType();
+
+    if ((*e_ptr).isCtv() && t1.isBuiltin() && !t2.isPointer()) {
+        // TODO also need to check conversion otherwise (eg. Struct a = 123)
+        // TODO if bool, always allow, except in init?
+        if (t1.isBool()) return true;
+
+        return checkRange(c.diags, lhs, *e_ptr);
+    }
+
+    const Type* lcanon = t1.getTypeOrNil();
+    const Type* rcanon = t2.getTypeOrNil();
+
+    if (lcanon == rcanon) return true;
+
+    c.lhs = lhs;
+    c.rhs = rhs;
+    c.expr_ptr = e_ptr;
+    c.loc = loc;
+
+    return c.checkTypes(lcanon, rcanon);
+}
+
+fn bool Checker.checkTypes(Checker* c, const Type* lcanon, const Type* rcanon) {
+
+    u8 res = Conversions[rcanon.getKind()][lcanon.getKind()];
+    switch (res) {
+    case 0: // cannot happen
+        break;
+    case 1: // not allowed
+    case 8: //  8 = Array -> Array
+    case 13: // Builtin -> Enum
+    case 14: // Enum -> Enum (not allowed, since the ptr check already filters out the allowed ones)
+    case 15: // Builtin -> Func
+        return c.conversionError("invalid type conversion from");
+    case 2: //  2 = Builtin -> Builtin
+        return c.checkBuiltins(lcanon, rcanon);
+    case 3: //  3 = Builtin -> Pointer (only if usize/u64/u32)
+        return c.checkBuiltin2Pointer(lcanon, rcanon);
+    case 4: //  4 = Pointer -> Builtin (only if usize/u64/u32)
+        return c.checkPointer2Builtin(lcanon, rcanon);
+    case 5: //  5 = Pointer -> Pointer
+        return c.checkPointers(lcanon, rcanon);
+    case 6: //  6 = Pointer -> Func (void* or Func*)
+        return c.checkPointer2Func(lcanon, rcanon);
+    case 7: //  7 = Array -> Pointer
+        break;  // should not happen
+    case 9: //  9 = Struct -> Struct
+        return c.conversionError("conversion between struct of different types:");
+    case 10: // 10 = Enum -> Builtin (check range)
+        return c.checkEnum2Int(lcanon, rcanon);
+    case 11: // Func -> Pointer (void* or Func*)
+        return c.checkFunc2Pointer(lcanon, rcanon);
+    case 12: // Func -> Func
+        return c.checkFunc2Func(lcanon, rcanon);
+    case 16: // Function -> Builtin
+        return c.checkFunc2Builtin(lcanon, rcanon, false);
+    case 17: // Anything -> Void
+        return true;
+    default:
+        break;
+    }
+    return c.shouldNotHappen(lcanon, rcanon, res);
+}
+
+fn bool Checker.checkBuiltins(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // Note: lhs and rhs are not the same, otherwise ptr-check would have succeeded
+    const BuiltinType* lbuiltin = (BuiltinType*)lcanon;
+    const BuiltinType* rbuiltin = (BuiltinType*)rcanon;
+
+    if ((*c.expr_ptr).isCtv()) {
+        // TODO check value instead of type
+        return true;
+    }
+
+    u8 res = BuiltinConversions[rbuiltin.getBaseKind()][lbuiltin.getBaseKind()];
+    switch (res) {
+    case 0:     // should not happen
+        break;
+    case 1:     // ok, needs conversion
+        //c.diags.note(c.loc, "WIDEN %s -> %s", c.rhs.diagName(), c.lhs.diagName());
+        c.builder.insertImplicitCast(IntegralCast, c.expr_ptr, c.lhs);
+        return true;
+    case 2:     // incompatible
+        return c.conversionError("invalid type conversion from");
+    case 3:     // sign-conversion
+        if (c.checkIntConversion(lbuiltin)) {
+            c.builder.insertImplicitCast(IntegralCast, c.expr_ptr, c.lhs);
+        } else {
+            // TODO: is this just a warning?
+            c.conversionError("implicit conversion changes signedness:");
+        }
+        return true;
+    case 4:     // loss of integer-precision
+        if (c.checkIntConversion(lbuiltin)) {
+            c.builder.insertImplicitCast(IntegralCast, c.expr_ptr, c.lhs);
+        } else {
+            // TODO: is this just a warning?
+            c.conversionError("implicit conversion loses integer precision:");
+        }
+        return true;
+    case 5:     // float -> integer
+        // TODO: is this just a warning?
+        c.conversionError("implicit conversion turns floating-point number into integer:");
+        return true;
+    case 6:     // loss of FP-precision
+        if ((*c.expr_ptr).isCtv()) {
+            c.builder.insertImplicitCast(IntegralCast, c.expr_ptr, c.lhs);
+        } else {
+            // TODO: is this just a warning?
+            c.conversionError("implicit conversion loses floating-point precision:");
+        }
+        return true;
+    case 7:     // ok, no conversion needed
+        return true;
+    default:
+        break;
+    }
+    return c.shouldNotHappen(lcanon, rcanon, res);
+}
+
+fn bool Checker.checkBuiltin2Pointer(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // Note: only allow usize/(u32/u64) -> void*
+    const PointerType* ptr = (PointerType*)lcanon;
+    const BuiltinType* bi = (BuiltinType*)rcanon;
+
+    QualType inner = ptr.getInner();
+    bool ok = inner.isVoid();
+
+    BuiltinKind kind = bi.getKind();
+    // TODO or u32
+    ok &= (kind == USize || kind == UInt64);
+    if (!ok) {
+        return c.conversionError("incompatible integer to pointer conversion:");
+    }
+    return true;
+}
+
+fn bool Checker.checkPointer2Builtin(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // Note: only allow void* -> usize/(u32/u64) / bool
+    const BuiltinType* bi = (BuiltinType*)lcanon;
+
+    BuiltinKind kind = bi.getKind();
+    if (kind == Bool) {
+        c.builder.insertImplicitCast(PointerToBoolean, c.expr_ptr, getBuiltinQT(Bool));
+        return true;
+    }
+
+    const PointerType* ptr = (PointerType*)rcanon;
+    QualType inner = ptr.getInner();
+
+    // TODO or u32 (arch)
+    bool ok = inner.isVoid();
+    ok &= (kind == USize || kind == UInt64);
+
+    if (!ok) {
+        if (c.try_to_fix_type()) {
+            return c.conversionError("invalid type conversion from");
+        } else {
+            return c.conversionError("incompatible pointer to integer conversion:");
+        }
+    }
+
+    c.builder.insertImplicitCast(PointerToInteger, c.expr_ptr, getBuiltinQT(USize));
+    return true;
+}
+
+fn bool Checker.checkPointer2Func(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // only allow if pointer is void*
+    const PointerType* ptr = (PointerType*)rcanon;
+    QualType inner = ptr.getInner();
+    if (!inner.isVoid()) {
+        return c.conversionError("incompatible pointer to function conversion:");
+    }
+    c.builder.insertImplicitCast(BitCast, c.expr_ptr, c.lhs);
+    return true;
+}
+
+fn bool Checker.checkIntConversion(Checker* c, const BuiltinType* bi) {
+    Expr* e = *c.expr_ptr;
+    u32 wl = bi.getWidth();
+    ExprWidth w = getExprWidth(e);
+    //printf("INT CONVERSION signed|width: %d %d -> %d %d\n", w.is_signed, w.width, bi.isSigned(), w.width);
+
+    if (w.width > wl) return false;
+
+    if (w.is_signed != bi.isSigned()) {
+        // allow unsigned -> signed only if value is preserved (eg. u16 fits in i32)
+        if (!w.is_signed) return w.width < wl;
+        // only allow signed -> unsigned if positive: fully defined but requires explicit cast in c2
+        if (!e.isPositiveOrUB()) return false;
+    }
+    return true;
+}
+
+// Note: try to fix array type that has been decayed to a pointer
+fn bool Checker.try_to_fix_type(Checker* c) {
+    Expr* e = *c.expr_ptr;
+
+    if (e.isImplicitCast()) {
+        const ImplicitCastExpr* ic = (ImplicitCastExpr*)e;
+        if (ic.isArrayToPointerDecay()) {
+            e = ic.getInner();
+            c.rhs = e.getType();
+            return true;
+        }
+    }
+    return false;
+}
+
+fn bool pointer_conversion_allowed(QualType linner, QualType rinner) {
+    // Note: no need to fully compare, since otherwise the pointers above would have been the same
+    const Type* in1 = linner.getTypeOrNil();
+    const Type* in2 = rinner.getTypeOrNil();
+    if (in1 == in2) return true;
+
+    // TODO dont allow ptr** -> void* or reverse
+    if (in1.isVoidType()) return true; // ptr -> void* is allowed
+    if (in2.isVoidType()) return true; // void* -> ptr is allowed
+
+    // allow u8* -> char* and reverse
+    if (linner.isUInt8() && rinner.isChar()) return true;
+    if (linner.isChar() && rinner.isUInt8()) return true;
+
+    // TODO check ptr-ptr, use ptr-inner-table
+
+    return false;
+}
+
+fn bool Checker.checkPointers(Checker* c, const Type* lcanon, const Type* rcanon) {
+
+    const PointerType* ltype = (PointerType*)lcanon;
+    const PointerType* rtype = (PointerType*)rcanon;
+/*
+    if (ltype == rtype) { // this will only happen with AliasTypes
+        printf("  SAME, diff quals\n");
+        // TODO check quals
+        return true;
+    }
+*/
+
+    QualType linner = ltype.getInner();
+    QualType rinner = rtype.getInner();
+
+    if (!pointer_conversion_allowed(linner, rinner)) {
+        if (c.try_to_fix_type()) {
+            return c.conversionError("invalid type conversion from");
+        } else {
+            return c.conversionError("invalid pointer conversion from");
+        }
+    }
+
+    // Note: no need to fully compare, since otherwise the pointers above would have been the same
+    u32 rquals = rinner.getQuals();
+    if (rquals == 0) return true;
+
+    u32 lquals = linner.getQuals();
+    u32 discarded = (rquals & ~lquals) & (QualType_Const | QualType_Volatile);
+    if (discarded) {
+        switch (discarded) {
+        case QualType_Const:
+            c.diags.error(c.loc, "pointer conversion discards const qualifier");
+            return false;
+        case QualType_Volatile:
+            c.diags.error(c.loc, "pointer conversion discards volatile qualifier");
+            return false;
+        default:
+            c.diags.error(c.loc, "pointer conversion discards qualifiers");
+            return false;
+        }
+    }
+    return true;
+}
+
+fn bool Checker.checkFunc2Pointer(Checker* c, const Type* lcanon, const Type* rcanon) {
+    PointerType* pt = (PointerType*)lcanon;
+    QualType inner = pt.getInner();
+    if (inner.isVoid()) return true; // always allow conversion to 'void*'
+
+    return c.conversionError("invalid pointer conversion from");
+}
+
+fn bool Checker.checkEnum2Int(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // Note: enum constant values can never be negative
+    // TODO check if negative enum values are rejected
+    const BuiltinType* bi = (BuiltinType*)lcanon;
+    u32 width = bi.getWidth();
+    if (width == 64) return true;  // 64-bit
+
+    // NOTE: EnumConstDecls are CTV, but variables of the type are not!
+    if ((*c.expr_ptr).isCtv()) {
+        return checkRange(c.diags, c.lhs, *c.expr_ptr);
+    } else {
+        // compare impl type
+        const EnumType* et = (EnumType*)rcanon;
+        const EnumTypeDecl* etd = et.getDecl();
+        QualType impl = etd.getImplType();
+
+        return c.checkAssign(c.lhs, impl, c.expr_ptr, c.loc);
+    }
+}
+
+fn bool Checker.checkFunc2Func(Checker* c, const Type* lcanon, const Type* rcanon) {
+    FunctionType* ftl = (FunctionType*)lcanon;
+    FunctionDecl* fdl = ftl.getDecl();
+    FunctionType* ftr = (FunctionType*)rcanon;
+    FunctionDecl* fdr = ftr.getDecl();
+
+    if (fdr.getNumAutoArgs()) {
+        c.diags.error(c.loc, "functions used as function pointers cannot have auto-arguments");
+        return false;
+    }
+
+    if (!checkFunc2Func(fdl, fdr)) {
+        // TODO report exact location
+        return c.conversionError("invalid function conversion from");
+    }
+    return true;
+}
+
+fn bool checkFunc2Func(const FunctionDecl* fdl, const FunctionDecl* fdr) {
+    // compare rtype
+    QualType ql = fdl.getRType();
+    QualType qr = fdr.getRType();
+    if (ql.ptr != qr.ptr) return false;
+
+    u32 num1 = fdl.getNumParams();
+    u32 num2 = fdr.getNumParams();
+    if (num1 != num2) return false;
+    if (fdl.isVariadic() != fdr.isVariadic()) return false;
+
+    Decl** args1 = (Decl**)fdl.getParams();
+    Decl** args2 = (Decl**)fdr.getParams();
+    for (u32 i=0; i<num1; i++) {
+        Decl* a1 = args1[i];
+        Decl* a2 = args2[i];
+        QualType qt1 = a1.getType();
+        QualType qt2 = a2.getType();
+        if (qt1.ptr != qt2.ptr) {
+            if (qt1.isFunction() && qt2.isFunction()) {
+                FunctionDecl* fd1 = qt1.getFunctionType().getDecl();
+                FunctionDecl* fd2 = qt2.getFunctionType().getDecl();
+                if (checkFunc2Func(fd1, fd2)) continue;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+fn bool Checker.checkFunc2Builtin(Checker* c, const Type* lcanon, const Type* rcanon, bool explicit) {
+    const BuiltinType* bi = (BuiltinType*)lcanon;
+
+    BuiltinKind kind = bi.getKind();
+    if (kind == USize) return true;
+    if (kind == Bool) {
+        // only allow Callback types or weak-functions
+        FunctionType* ft = (FunctionType*)rcanon;
+        FunctionDecl* fd = ft.getDecl();
+        if (fd.canBeNil()) return true; // Variable with Function type (eg callback)
+
+        // TODO not always comparison (bool b = test1);
+        c.diags.error(c.loc, "comparison of function '%s' will always be true", fd.asDecl().getFullName());
+        return false;
+    }
+
+    if (kind == c.native_kind) return true;
+
+    if (explicit) {
+        c.diags.error(c.loc, "pointers may only be cast to integer type '%s'", c.native_kind.name);
+        return false;
+    } else {
+        return c.conversionError("invalid type conversion from");
+    }
+}
+
+public fn bool Checker.checkCast(Checker* c, QualType lhs, QualType rhs, SrcLoc lhsLoc, SrcLoc rhsLoc) {
+    c.lhs = lhs;
+    c.rhs = rhs;
+    c.loc = lhsLoc;
+    c.expr_ptr = nil;
+    // NOTE: expr_ptr used in some calls below!!
+    // TODO sometimes use rhsLoc
+    if (lhsLoc == 0) c.loc = rhsLoc; // TEMP HACK
+
+    QualType t1 = lhs.getCanonicalType();
+    QualType t2 = rhs.getCanonicalType();
+    const Type* lcanon = t1.getTypeOrNil();
+    const Type* rcanon = t2.getTypeOrNil();
+
+    u8 res = Conversions[rcanon.getKind()][lcanon.getKind()];
+    switch (res) {
+    case 0: // cannot happen
+        break;
+    case 1: // not allowed
+        return c.conversionError("invalid cast from");
+    case 2: //  2 = Builtin -> Builtin
+    case 5: //  5 = Pointer -> Pointer
+    case 6: //  6 = Pointer -> Func (void* or Func*)
+    case 10: // 10 = Enum -> Builtin
+    case 11: // 11 = Func -> Pointer (void* or Func*)
+    case 12: // Func -> Func
+    case 13: // Builtin -> Enum
+    case 14: // Enum -> Enum
+        return true;    // always allow
+    case 3: //  3 = Builtin -> Pointer (only if usize/u64/u32)
+        return c.checkBuiltin2PointerCast(lcanon, rcanon);
+    case 4: //  4 = Pointer -> Builtin (only if usize/u64/u32)
+        return c.checkPointer2BuiltinCast(lcanon, rcanon);
+    case 7: //  7 = Array -> Pointer
+    case 8: //  8 = Array -> Array
+    case 9: //  9 = Struct -> Struct
+        break;  // should not happen
+    case 15: // Builtin -> Func
+        return c.checkBuiltin2PointerCast(lcanon, rcanon);
+    case 16: // Func -> Builtin
+        return c.checkFunc2Builtin(lcanon, rcanon, true);
+    default:
+        break;
+    }
+    return c.shouldNotHappen(lcanon, rcanon, res);
+}
+
+fn bool Checker.checkBuiltin2PointerCast(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // only allow cast from pointer-size int (u32/u64 depending on arch) to pointer
+    const BuiltinType* bi = (BuiltinType*)rcanon;
+
+    BuiltinKind kind = bi.getKind();
+    if (kind == USize) return true;
+    // Note: we dont allow cast from pointer to bool! (implicit conversion is ok)
+    if (kind == c.native_kind) return true;
+
+    c.diags.error(c.loc, "only integers of type '%s' may be cast to a pointer", c.native_kind.name);
+
+    return false;
+}
+
+fn bool Checker.checkPointer2BuiltinCast(Checker* c, const Type* lcanon, const Type* rcanon) {
+    // only allow cast from pointer to pointer-size int (u32/u64 depending on arch)
+    const BuiltinType* bi = (BuiltinType*)lcanon;
+
+    BuiltinKind kind = bi.getKind();
+    if (kind == USize) return true;
+    // Note: we dont allow cast from pointer to bool! (implicit conversion is ok)
+    if (kind == c.native_kind) return true;
+
+    c.diags.error(c.loc, "pointers may only be cast to integer type '%s'", c.native_kind.name);
+
+    return false;
+}
+
+// Just takes smallest type, dont promote both sides to i32
+// No need to adjust for 32-bit as ISize and USize are converted before the lookup
+const BuiltinKind X = Bool;  // used as a placeholder for ISize/Usize entries
+const BuiltinKind[BuiltinKind][BuiltinKind] ConditionalOperatorResult = {
+    //  Bool    Char    Int8     Int16    Int32    Int64    UInt8    UInt16   UInt32   UInt64   Float32  Float64 ISize USize
+    // Bool ->
+    {  Bool,    Char,    Int8,    Int16,   Int32,   Int64,   UInt8,   UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // Char ->
+    {  Char,    Char,    Int16,   Int16,   Int32,   Int64,   UInt8,   UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int8 ->
+    {  Int8,    Int16,   Int8,    Int16,   Int32,   Int64,   UInt8,   UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int16 ->
+    {  Int16,   Int16,   Int16,   Int16,   Int32,   Int64,   Int16,   UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int32 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int64 ->
+    {  Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   UInt64,  Float32, Float64, X, X },
+    // UInt8 ->
+    {  UInt8,   UInt8,   UInt8,   Int16,   Int32,   Int64,   UInt8,   UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt16 ->
+    {  UInt16,  UInt16,  UInt16,  UInt16,  Int32,   Int64,   UInt16,  UInt16,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt32 ->
+    {  UInt32,  UInt32,  UInt32,  UInt32,  UInt32,  Int64,   UInt32,  UInt32,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt64 ->
+    {  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  Float32, Float64, X, X },
+    // Flt32 ->
+    {  Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float64, X, X },
+    // Flt64 ->
+    {  Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, X, X },
+    // ISize ->
+    {  X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X, X },
+    // USize ->
+    {  X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X, X },
+}
+
+public fn QualType get_common_arithmetic_type(BuiltinType* bi1, BuiltinType* bi2) {
+    return getBuiltinQT(ConditionalOperatorResult[bi2.getBaseKind()][bi1.getBaseKind()]);
+}
+
+// See ISO/IEC 9899:201x 6.3.1
+// No need to adjust for 32-bit as ISize and USize are converted before the lookup
+const BuiltinKind[BuiltinKind][BuiltinKind] UsualArithmeticConversions = {
+    // Bool     Char     Int8     Int16    Int32    Int64    UInt8    UInt16   UInt32   UInt64   Float32  Float64  ISize USize
+    // Bool ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Char ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int8 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int16 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int32 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // Int64 ->
+    {  Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   Int64,   UInt64,  Float32, Float64, X, X },
+    // UInt8 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt16 ->
+    {  Int32,   Int32,   Int32,   Int32,   Int32,   Int64,   Int32,   Int32,   UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt32 ->
+    {  UInt32,  UInt32,  UInt32,  UInt32,  UInt32,  Int64,   UInt32,  UInt32,  UInt32,  UInt64,  Float32, Float64, X, X },
+    // UInt64 ->
+    {  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  UInt64,  Float32, Float64, X, X },
+    // Flt32 ->
+    {  Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float32, Float64, X, X },
+    // Flt64 ->
+    {  Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, Float64, X, X },
+    // ISize ->
+    {  X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X, X },
+    // USize ->
+    {  X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X,       X, X },
+}
+
+public fn QualType usual_arithmetic_conversion(const BuiltinType* bi1, const BuiltinType* bi2) {
+    return getBuiltinQT(UsualArithmeticConversions[bi1.getBaseKind()][bi2.getBaseKind()]);
+}
+

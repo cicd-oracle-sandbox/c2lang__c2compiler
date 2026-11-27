@@ -1,0 +1,425 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module c2cat_main;
+
+import c2_tokenizer { Tokenizer, ErrorLevel }
+import attr { AttrRegistry }
+import color { Color }
+import file_buffer { FileBuffer }
+import keywords;
+import src_loc { SrcLoc }
+import string_buffer { StringBuf }
+import string_map { StringMap }
+import string_pool { StringPool }
+import token { Kind, Token }
+
+import ctype { isspace }
+import stdio { printf, fprintf, fflush, fputs, stdout, stderr }
+import stdlib { exit, EXIT_FAILURE, EXIT_SUCCESS }
+import string { strcmp }
+import unistd { isatty }
+
+type Style enum u8 (const char* const name @(unused), const Color default_color) {
+    Normal     : { "normal",     Normal },
+    Identifier : { "identifier", None },
+    Integer    : { "integer",    Magenta },
+    Float      : { "float",      Magenta },
+    Charconst  : { "charconst",  Magenta },
+    String     : { "string",     Magenta },
+    Operator   : { "operator",   None },
+    Type       : { "type",       Green },
+    Keyword    : { "keyword",    Byellow },
+    Function   : { "function",   White },
+    Attr       : { "attr",       Blue },
+    Feature    : { "feature",    Blue },
+    Invalid    : { "invalid",    Bred },
+    Comment    : { "comment",    Bcyan },
+    Warning    : { "warning",    Bred },
+    Error      : { "error",      Bred },
+}
+
+fn void usage(const char* me) {
+    printf("Usage: %s [options] file.c2 ...\n"
+           "    -c  --check  only check token syntax, no content output\n"
+           "    --color      force colorized output\n"
+           "    --no-color   disable colorized output\n"
+           , me);
+}
+
+type C2cat struct {
+    StringPool* pool;
+    StringBuf* out;
+    StringBuf* out2;
+    Tokenizer* tokenizer;
+    AttrRegistry attr_registry;
+    const char* filename;
+    const char* input;
+    u32 offset;
+    u32 length;
+    u8 in_attributes; // 0 no, 1 seen @, 2 (, ) -> 0
+    bool check_only;
+    bool has_error;
+    ErrorLevel error_level;
+    Style[Kind] token_style;
+    Color[Style] style_color;
+}
+
+fn bool C2cat.init_colors(C2cat* ctx) {
+    for (Kind k = Kind.min; k <= Kind.max; k++) {
+        Style style = Normal;
+        switch (k) {
+        case None:
+            style = Normal;
+            break;
+        case Identifier:
+            style = Identifier;
+            break;
+        case IntegerLiteral:
+            style = Integer;
+            break;
+        case FloatLiteral:
+            style = Float;
+            break;
+        case CharLiteral:
+            style = Charconst;
+            break;
+        case StringLiteral:
+            style = String;
+            break;
+        case LParen ... GreaterGreaterEqual:
+            style = Operator;
+            break;
+        case KW_bool ... KW_unsigned:
+            style = Type;
+            break;
+        case KW_typedef ... KW_while:
+            if (k.isQualifier()) style = Type;
+            else style = Keyword;
+            break;
+        case Feat_if ... Feat_warning:
+            style = Feature;
+            break;
+        case Invalid:
+            style = Invalid;
+            break;
+        case LineComment:
+        case BlockComment:
+            style = Comment;
+            break;
+        case Eof:
+            style = Normal;
+            break;
+        case Error:
+            style = Error;
+            break;
+        }
+        ctx.token_style[k] = style;
+    }
+    for (Style s = Style.min; s <= Style.max; s++) {
+        ctx.style_color[s] = s.default_color;
+    }
+    // TODO: customize colors from environment variable, config file or command line argument
+    return true;
+}
+
+fn bool C2cat.is_attribute(C2cat* ctx, u32 name_idx) {
+    return ctx.attr_registry.find(name_idx) != Unknown;
+}
+
+fn void C2cat.update_state(C2cat* ctx, const Token* tok) {
+    switch (ctx.in_attributes) {
+    case 0:
+        if (tok.kind == At) ctx.in_attributes = 1;
+        break;
+    case 1:
+        if (tok.kind == LParen) ctx.in_attributes = 2;
+        break;
+    case 2:
+        if (tok.kind == RParen) ctx.in_attributes = 0;
+        break;
+    }
+}
+
+fn void C2cat.print_token(C2cat* ctx, const Token* tok) {
+    StringBuf* out = ctx.out;
+    u32 pos = tok.loc - ctx.tokenizer.loc_start;    // token start offset
+    u32 tok_len = tok.len;                          // token length in bytes
+
+    if (pos < ctx.offset) {
+        // token starts before end of previous token, this is an error
+        ctx.print_error(Error, tok.loc, "invalid token position (offset=%d pos=%d)", ctx.offset, pos);
+        ctx.offset = pos;
+    }
+    if (pos > ctx.offset) {
+        if (!ctx.check_only) {
+            // copy stuff from file to out (from end of last token to start of current)
+            out.add2(ctx.input + ctx.offset, pos - ctx.offset);
+        }
+        // check for whitespace only
+        for (u32 i = ctx.offset; i < pos; i++) {
+            if (!isspace(ctx.input[i])) {
+                ctx.print_error(Error, ctx.tokenizer.loc_start + i,
+                                "non space character '\\x%2x' between tokens",
+                                ctx.input[i] & 0xFF);
+                break;
+            }
+        }
+        ctx.offset = pos;
+    }
+
+    Style s = ctx.token_style[tok.kind];
+    if (tok.kind == Kind.Identifier) {
+        if (ctx.in_attributes) {
+            s = ctx.is_attribute(tok.name_idx) ? Attr : Invalid;
+        } else
+        if (ctx.input[ctx.offset + tok_len] == '(') {
+            s = Function;
+        }
+    }
+
+    if (!ctx.check_only) {
+        if (s && ctx.style_color[s]) out.color(ctx.style_color[s]);
+        out.add2(ctx.input + ctx.offset, tok_len);
+        if (s && ctx.style_color[s]) out.color(ctx.style_color[Normal]);
+    }
+    ctx.offset += tok_len;
+}
+
+type Location struct {
+    u32 line, column, line_start, line_length;
+}
+
+fn bool Location.init(Location* loc, const char* src, u32 offset) {
+    u32 line = 0;
+    u32 line_start = 0;
+    u32 i;
+    for (i = 0; src[i]; i++) {
+        if (src[i] == '\n') {
+            if (i >= offset)
+                break;
+            line++;
+            line_start = i + 1;
+        }
+    }
+    if (i >= offset) {
+        loc.line = line + 1;
+        loc.column = offset - line_start + 1;
+        loc.line_start = line_start;
+        loc.line_length = i - line_start;
+        return true;
+    }
+    loc.line = 0;
+    loc.column = 0;
+    loc.line_start = 0;
+    loc.line_length = 0;
+    return false;
+}
+
+fn void C2cat.print_error(C2cat* ctx,
+                          ErrorLevel level,
+                          SrcLoc loc,
+                          const char* format @(printf_format), ...)
+{
+    StringBuf* out2 = ctx.out2;
+    if (!ctx.check_only && !ctx.out.endsWith('\n')) out2.add1('\n');
+    out2.color(ctx.style_color[Error]);
+    Location sloc.init(ctx.input, loc - ctx.tokenizer.loc_start);
+    if (sloc.line) {
+        out2.print("%s:%d:%d: ", ctx.filename, sloc.line, sloc.column);
+    } else {
+        out2.print("%s: ", ctx.filename);
+    }
+    switch (ctx.error_level = level) {
+    case Note:
+        out2.add("note: ");
+        break;
+    case Warning:
+        out2.add("warning: ");
+        break;
+    default:
+        out2.add("error: ");
+        break;
+    }
+    va_list args;
+    va_start(args, format);
+    out2.vprintf(format, args);
+    out2.color(ctx.style_color[Normal]);
+    out2.add1('\n');
+    va_end(args);
+    if (sloc.line) {
+        out2.print("%.*s\n", (i32)sloc.line_length, ctx.input + sloc.line_start);
+        out2.print("%*s^\n", (i32)sloc.column - 1, "");
+    }
+    if (!ctx.check_only) {
+        fputs(ctx.out.data(), stdout);
+        fflush(stdout);
+        ctx.out.clear();
+    }
+    fputs(ctx.out2.data(), stderr);
+    fflush(stderr);
+    ctx.out2.clear();
+    ctx.has_error = true;
+}
+
+fn void C2cat.on_tokenizer_error(void* arg, ErrorLevel level, SrcLoc loc, const char* msg) {
+    C2cat* ctx = arg;
+    ctx.print_error(level, loc, "%s", msg);
+}
+
+fn i32 c2cat_file(const char* filename, bool use_color, bool use_color2, bool check_only)
+{
+    FileBuffer file.init();
+    if (!file.loadFile(filename)) {
+        fprintf(stderr, "c2cat: error opening %s: %s\n", filename, file.getError());
+        file.deinit();
+        return -1;
+    }
+
+    StringPool* pool = StringPool.create(16*1024, 1024);
+    StringBuf* out = StringBuf.create(16*1024, use_color, 2);
+    StringBuf* out2 = StringBuf.create(1024, use_color2, 2);
+    StringBuf* buf = StringBuf.create(1024, false, 0);
+    const char* input = file.data();
+    u32 file_size = file.size();
+    keywords.Info kwinfo.init(pool);
+    StringMap features.init(pool);
+
+    C2cat ctx = {
+        .pool = pool,
+        .out = out,
+        .out2 = out2,
+        .filename = filename,
+        .input = input,
+        .offset = 0,
+        .length = file_size,
+        .in_attributes = 0,
+        .check_only = check_only,
+    }
+
+    ctx.init_colors();
+
+    Tokenizer tokenizer.init(pool, buf, input, 1, &kwinfo, &features,
+                                          C2cat.on_tokenizer_error, &ctx, true);
+    ctx.tokenizer = &tokenizer;
+    ctx.attr_registry.init(ctx.pool);
+
+    Token tok.init();
+
+    while (!tok.done) {
+        tokenizer.lex(&tok);
+        //printf("%4d %s\n", tok.loc, tok.kind.name);
+        if (ctx.error_level) {
+            if (ctx.error_level == FatalError) goto done;
+            ctx.error_level = (ErrorLevel)0;
+        }
+        ctx.update_state(&tok);
+        ctx.print_token(&tok);
+    }
+
+    if (ctx.offset < ctx.length) {
+        // EOF token occurs before end of file, this is an error
+        ctx.print_error(Error, tok.loc, "invalid EOF token position (offset=%d length=%d)",
+                        ctx.offset, ctx.length);
+    }
+    if (ctx.offset > ctx.length) {
+        if (!ctx.check_only) {
+            u32 len = ctx.length - ctx.offset;
+            out.color(ctx.style_color[Error]);
+            out.add2(ctx.input + ctx.offset, len);
+            out.color(ctx.style_color[Normal]);
+        }
+        // EOF token should have ctx.offset == ctx.length
+        ctx.print_error(Warning, tok.loc, "trailing bytes after end of file token");
+    }
+    if (!ctx.check_only) {
+        fputs(out.data(), stdout);
+        fflush(stdout);
+    }
+
+done:
+    out.free();
+    out2.free();
+    buf.free();
+    pool.free();
+    file.deinit();
+
+    return ctx.has_error;
+}
+
+public fn i32 main(i32 argc, const char** argv)
+{
+    bool use_color = color.useColor();
+    bool use_color2 = isatty(2);
+    bool check_only = false;
+    i32 status = 0;
+
+    // parse all command line options and count files
+    u32 nfiles = 0;
+    bool done_options = false;
+    for (i32 i = 1; i < argc; i++) {
+        const char* arg = argv[i];
+        if (*arg == '-' && !done_options) {
+            switch (arg) {
+            case "--":
+                done_options = true;
+                break;
+            case "-c":
+            case "--check":
+                check_only = true;
+                break;
+            case "--color":
+                use_color = true;
+                break;
+            case "--no-color":
+                use_color = false;
+                use_color2 = false;
+                break;
+            case "-?":
+            case "-h":
+            case "--help":
+                usage(argv[0]);
+                exit(EXIT_SUCCESS);
+            default:
+                fprintf(stderr, "c2cat: unknown option %s\n", arg);
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            nfiles++;
+        }
+    }
+
+    if (!nfiles) {
+        usage(argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    done_options = false;
+    u32 filenum = 0;
+    for (i32 i = 1; i < argc; i++) {
+        const char* arg = argv[i];
+        if (*arg == '-' && !done_options) {
+            done_options = !strcmp(arg, "--");
+            continue;
+        }
+        if (nfiles > 1 && !check_only) {
+            if (filenum++) printf("\n");
+            printf("==> %s <==\n", arg);
+        }
+        if (c2cat_file(arg, use_color, use_color2, check_only))
+            status = EXIT_FAILURE;
+    }
+    return status;
+}

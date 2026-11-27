@@ -1,0 +1,370 @@
+/* Copyright 2022-2026 Bas van den Berg
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module ir_generator;
+
+import ast { * }
+import ir { BlockId, BlockKind }
+import ir_context { IrContext }
+import value_type { Value }
+
+// returns true if more stmts can follow
+fn bool Generator.emitStmt(Generator* gen, const Stmt* s) {
+    switch (s.getKind()) {
+    case Return:
+        const ReturnStmt* r = (ReturnStmt*)s;
+        const Expr* retval = r.getValue();
+        if (retval) {
+            ir.Ref ref;
+            gen.emitExpr(&ref, retval);
+            gen.ctx.addRet1Instr(ref);
+        } else {
+            gen.ctx.addRet0Instr();
+        }
+        return false;
+    case Expr:
+        ir.Ref dontcare;
+        gen.emitExpr(&dontcare, (Expr*)s);
+        return true;
+    case If:
+        gen.emitIfStmt(s);
+        return true;
+    case While:
+        gen.emitWhileStmt(s, 0);
+        return true;
+    case For:
+        gen.emitForStmt(s, 0);
+        return true;
+    case Switch:
+        gen.emitSwitchStmt(s, 0);
+        return true;
+    case Break:
+        gen.emitBreakStmt((BreakStmt*)s);
+        return false;
+    case Continue:
+        gen.emitContinueStmt((ContinueStmt*)s);
+        return false;
+    case Fallthrough:
+        // nothing to be done
+        return false;
+    case Label:
+        return gen.emitLabelStmt((LabelStmt*)s);
+    case Goto:
+        const GotoStmt* g = (GotoStmt*)s;
+
+        BlockId label_blk = gen.getLabelBlockGoto(g.getNameIdx());
+        gen.ctx.addJmpInstr(label_blk);
+        return false;
+    case Compound:
+        CompoundStmt* c = (CompoundStmt*)s;
+        gen.emitStmts(c.getStmts(), c.getCount());
+        return true;
+    case Decl:
+        const DeclStmt* ds = (DeclStmt*)s;
+        u32 count = ds.getDeclCount();
+        for (u32 i = 0; i < count; i++) {
+            VarDecl* vd = ds.getDecl(i);
+
+            if (vd.isStatic()) return true; // already done
+
+            const Expr* ie = vd.getInit();
+            if (ie) {
+                gen.emitInitExpr(vd, ie);
+            }
+        }
+        return true;
+    case Asm:
+        break;
+    case Assert:
+        //if (gen.enable_asserts) gen.emitAssertStmt(s);
+        return true;
+    case StaticAssert:
+        return true;
+    }
+    s.dump();
+    assert(0); // TODO
+    return true;
+}
+
+fn void Generator.emitBreakStmt(Generator* gen, const BreakStmt* b) {
+    BlockId dest;
+    if (b.hasName()) {
+        dest = gen.labels.getBreak(b.getName());
+    } else {
+        assert(gen.num_scopes);
+        dest = gen.scopes[gen.num_scopes-1].break_block;
+    }
+    gen.ctx.addJmpInstr(dest);
+}
+
+fn void Generator.emitContinueStmt(Generator* gen, const ContinueStmt* c) {
+    BlockId dest;
+    if (c.hasName()) {
+        dest = gen.labels.getContinue(c.getName());
+    } else {
+        assert(gen.num_scopes);
+        dest = gen.scopes[gen.num_scopes-1].continue_block;
+    }
+    gen.ctx.addJmpInstr(dest);
+}
+
+fn bool Generator.emitLabelStmt(Generator* gen, const LabelStmt* l) {
+    IrContext* c = gen.ctx;
+
+    u32 name_idx = l.getNameIdx();
+    if (l.hasGoto()) {
+        // look up in label-table
+        BlockId label_blk = gen.getLabelBlockGoto(name_idx);
+
+        if (!c.isBlockTerminated()) c.addJmpInstr(label_blk);
+        c.endBlock();
+        c.startBlock(label_blk);
+
+        gen.name_buf.clear();
+        gen.name_buf.add(gen.idx2name(name_idx));
+        c.addComment(gen.name_buf.data());
+    }
+    const Stmt* ls = l.getStmt();
+    if (!ls) return true;
+
+    switch (ls.getKind()) {
+    case For:
+        gen.emitForStmt(ls, name_idx);
+        break;
+    case While:
+        gen.emitWhileStmt(ls, name_idx);
+        break;
+    case Switch:
+        gen.emitSwitchStmt(ls, name_idx);
+        break;
+    default:
+        return gen.emitStmt(ls);
+    }
+    return true;
+}
+
+fn void Generator.emitIfStmt(Generator* gen, const Stmt* s) {
+    IrContext* c = gen.ctx;
+
+    const IfStmt* if_stmt = (IfStmt*)s;
+    const Stmt* decl = if_stmt.getDecl();
+    const Expr* cond = if_stmt.getCond();
+    const Stmt* then_stmt = if_stmt.getThen();
+    const Stmt* else_stmt = if_stmt.getElse();
+
+    if (!decl && cond.isCtv()) {
+        Value v = ast.evalExpr(cond);
+        if (v.isZero()) {
+            if (else_stmt) gen.emitStmt(else_stmt);
+        } else {
+            gen.emitStmt(then_stmt);
+        }
+        return;
+    }
+
+    BlockId then_blk = c.createBlock(BlockKind.IfTrue);
+    BlockId else_blk = 0;
+    if (else_stmt) else_blk = c.createBlock(BlockKind.IfFalse);
+    BlockId join_blk = c.createBlock(BlockKind.IfJoin);
+
+    BlockId false_blk = join_blk;
+    if (else_stmt) false_blk = else_blk;
+
+    // cond
+    if (decl && !if_stmt.hasSourceCond()) {
+        DeclStmt* ds = (DeclStmt*)decl;
+        VarDecl* vd = ds.getDecl(0);
+        Decl* d = (Decl*)vd;
+
+        // TODO should check for CTV values
+        ir.Ref rhs;
+        gen.emitExpr(&rhs, vd.getInit());
+        ir.Ref lhs;
+        gen.emitVarDecl(&lhs, d);
+        ir.Type t = ir.Type.I32; // TODO get type
+        gen.emitAssignCond(t, lhs, rhs, then_blk, join_blk, then_blk);
+    } else {
+        if (decl) gen.emitStmt(decl);
+        // TODO should check for CTV values
+        gen.emitCond(cond, then_blk, false_blk, then_blk);
+    }
+
+    // then-block
+    gen.emitStmt(then_stmt);
+    if (!c.isBlockTerminated()) c.addJmpInstr(join_blk);
+    c.endBlock();
+
+    // optional else-block
+    if (else_stmt) {
+        c.startBlock(else_blk);
+        gen.emitStmt(else_stmt);
+        if (!c.isBlockTerminated()) c.addJmpInstr(join_blk);
+        c.endBlock();
+    }
+    // join block
+    c.startBlock(join_blk);
+}
+
+fn void Generator.emitWhileStmt(Generator* gen, const Stmt* s, u32 label_name) {
+    IrContext* c = gen.ctx;
+    const WhileStmt* w = (WhileStmt*)s;
+
+    // TODO check if CtvCondition, then skip condition/body
+    BlockId cond_blk = c.createBlock(BlockKind.WhileCond);
+    BlockId body_blk = c.createBlock(BlockKind.WhileBody);
+    BlockId join_blk = c.createBlock(BlockKind.WhileJoin);
+
+    if (label_name) gen.labels.add2(label_name, join_blk, cond_blk);
+
+    assert(!c.isBlockTerminated());
+    c.addJmpInstr(cond_blk);
+    c.endBlock();
+
+    // cond
+    c.startBlock(cond_blk);
+
+    Stmt* cond = w.getCond();
+    if (cond.isDecl()) {
+        DeclStmt* ds = (DeclStmt*)cond;
+        VarDecl* vd = ds.getDecl(0);
+        Decl* d = (Decl*)vd;
+
+        // TODO should check for CTV values
+        ir.Ref rhs;
+        gen.emitExpr(&rhs, vd.getInit());
+        ir.Ref lhs;
+        gen.emitVarDecl(&lhs, d);
+        ir.Type t = ir.Type.I32; // TODO get type
+        gen.emitAssignCond(t, lhs, rhs, body_blk, join_blk, body_blk);
+    } else {
+        assert(cond.isExpr());
+        Expr* e = (Expr*)cond;
+        gen.emitCond(e, body_blk, join_blk, body_blk);
+    }
+
+    // body
+    gen.enterScope(join_blk, cond_blk);
+    gen.emitStmt(w.getBody());
+    gen.leaveScope();
+    if (!c.isBlockTerminated()) c.addJmpInstr(cond_blk);
+    c.endBlock();
+
+    // join
+    c.startBlock(join_blk);
+}
+
+fn void Generator.emitForStmt(Generator* gen, const Stmt* s, u32 label_name) {
+    IrContext* c = gen.ctx;
+    const ForStmt* f = (ForStmt*)s;
+
+    const Stmt* ie = f.getInit();
+    if (ie) gen.emitStmt(ie);
+
+    // TODO check if CtvCondition, then skip rest
+    BlockId cond_blk = c.createBlock(BlockKind.ForCond);
+    BlockId body_blk = c.createBlock(BlockKind.ForBody);
+    BlockId cont_blk = c.createBlock(BlockKind.ForCont);
+    BlockId join_blk = c.createBlock(BlockKind.ForJoin);
+
+    if (label_name) gen.labels.add2(label_name, join_blk, cont_blk);
+
+    assert(!c.isBlockTerminated());
+    c.addJmpInstr(cond_blk);
+    c.endBlock();
+
+    // cond
+    c.startBlock(cond_blk);
+
+    Expr* cond = f.getCond();
+    if (cond) {
+        gen.emitCond(cond, body_blk, join_blk, body_blk);
+    } else {
+        c.endBlock();
+        c.startBlock(body_blk);
+    }
+    // body
+    gen.enterScope(join_blk, cont_blk);
+    gen.emitStmt(f.getBody());
+    gen.leaveScope();
+    if (!c.isBlockTerminated()) c.addJmpInstr(cont_blk);
+    c.endBlock();
+
+    // cont
+    c.startBlock(cont_blk);
+    Expr* cont = f.getCont();
+    if (cont) {
+        ir.Ref dontcare;
+        gen.emitExpr(&dontcare, cont);
+    }
+    c.addJmpInstr(cond_blk);
+    c.endBlock();
+
+    // join
+    c.startBlock(join_blk);
+}
+
+#if 0
+fn void Generator.emitAssertStmt(Generator* gen, const Stmt* s) {
+    StringBuf* out = gen.out;
+    const AssertStmt* a = (AssertStmt*)s;
+
+    //public fn Expr* AssertStmt.getInner(const AssertStmt* s) { return s.inner; }
+
+    char[32] body_blk;
+    char[32] join_blk;
+    snprintf(body_blk, countof(body_blk), "@assert_body.%d", gen.getNewBlockIndex());
+    snprintf(join_blk, countof(join_blk), "@assert_join.%d", gen.getNewBlockIndex());
+
+    // TODO check if CtvCondition, then skip rest
+    ExprRef check;
+    gen.emitCondition(&check, (Stmt*)a.getInner());
+    assert(!gen.block_terminated);
+    out.print("\tjnz %s, %s, %s\n", check.ref, join_blk, body_blk);
+
+    // body
+    gen.startBlock(body_blk, body_blk);
+    // TODO generate global strings for location and check (assert_loc_str, assert_cond_str)
+    //"ir_examples/builtins.c2:6: test.test1", "i>10");
+
+    // location string
+    Location loc = gen.sm.getLocation(a.getLoc());
+    const char* funcname = gen.cur_function.asDecl().getFullName();
+    char[512] location;
+    snprintf(location, countof(location), "%s:%d: %s", loc.filename, loc.line, funcname);
+    ExprRef loc_str;
+    gen.createString(&loc_str, location);
+
+    // condition string
+    Expr* inner = a.getInner();
+    gen.start.clear();
+    inner.printLiteral(gen.start);
+    ExprRef cond_str;
+    gen.createString(&cond_str, gen.start.data());
+
+    static const char[] name = "$gbl_assert_str";
+    static const char[] self = "$self_str";
+    if (!gen.assert_generated) {
+        // TODO need to know name of program (pass to generator)
+        gen.globals.print("data %s = align 1 { b \"%s\\000\" }\n", self, gen.target);
+        gen.globals.print("data %s = align 1 { b \"%%s: %%s: Assertion '%%s' failed\n\\000\" }\n", name);
+        gen.assert_generated = true;
+    }
+    out.print("\tcall $dprintf(l 2, l %s, l %s, l %s, l %s)\n", name, self, loc_str.ref, cond_str.ref);
+    out.add("\tcall $abort()\n");
+
+    gen.startBlock(join_blk, join_blk);
+}
+#endif
+

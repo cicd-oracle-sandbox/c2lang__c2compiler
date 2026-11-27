@@ -1,0 +1,13 @@
+// @warnings{no-unused}
+module test;
+
+type Enum enum u8 { A, B }
+
+fn void test1(Enum e) {
+    u32 v = e << 30;
+}
+
+fn u32 test2(Enum e) {
+    return e << 30;
+}
+

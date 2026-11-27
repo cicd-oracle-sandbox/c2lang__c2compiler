@@ -1,0 +1,323 @@
+module math extern "C";
+
+// NOTE: long double (16 bytes on 64-bit system) not supported yet
+
+const double HUGE_VAL   = 1e500;
+const float HUGE_VALF   = 1e50F;
+//const long double HUGE_VALL  = 1e5000;
+const double NAN        = 0.0 / 0.0;
+const double INFINITY   = 1.0 / 0.0;
+#if SYSTEM_LINUX
+const int FP_NAN        = 0;
+const int FP_INFINITE   = 1;
+const int FP_ZERO       = 2;
+const int FP_SUBNORMAL  = 3;
+const int FP_NORMAL     = 4;
+#endif
+#if SYSTEM_FREEBSD || SYSTEM_OPENBSD
+const int FP_INFINITE   = 0x01;
+const int FP_NAN        = 0x02;
+const int FP_NORMAL     = 0x04;
+const int FP_SUBNORMAL  = 0x08;
+const int FP_ZERO       = 0x10;
+#endif
+#if SYSTEM_DARWIN
+const int FP_NAN        = 1;
+const int FP_INFINITE   = 2;
+const int FP_ZERO       = 3;
+const int FP_NORMAL     = 4;
+const int FP_SUBNORMAL  = 5;
+#endif
+
+union FP32_ { f32 f; u32 u; }
+union FP64_ { f64 d; u64 u; }
+
+int fpclassifyf(float) @(pure, cname="__fpclassifyf");
+int isfinitef(float) @(pure, cname="__isfinitef");
+int isinff(float) @(pure, cname="__isinff");
+int isnanf(float x) @(pure) { return x != x; }
+int isnormalf(float) @(pure, cname="__isnormalf");
+int signbitf(float f) { FP32_ u; u.f = f; return (u.u >> 31) & 1; }
+
+int isnan(double x) @(pure) { return x != x; }
+int signbit(double d) { FP64_ u; u.d = d; return (u.u >> 63) & 1; }
+#if SYSTEM_LINUX || SYSTEM_OPENBSD
+int fpclassify(double) @(pure, cname="__fpclassify");
+#else
+int fpclassify(double) @(pure, cname="__fpclassifyd");
+#endif
+#if SYSTEM_LINUX || SYSTEM_OPENBSD || SYSTEM_FREEBSD
+int isfinite(double) @(pure, cname="__isfinite");
+int isinf(double) @(pure, cname="__isinf");
+int isnormal(double) @(pure, cname="__isnormal");
+#else
+int isfinite(double) @(pure, cname="__isfinited");
+int isinf(double) @(pure, cname="__isinfd");
+int isnormal(double) @(pure, cname="__isnormald");
+#endif
+//int fpclassifyl(long double) @(pure);
+//int isfinitel(long double) @(pure);
+//int isinfl(long double) @(pure);
+//int isnanl(long double) @(pure);
+//int isnormall(long double) @(pure);
+//int signbitl(long double) @(pure);
+
+#if 0
+//TODO: use type functions
+//fn bool f32.isnan(f32 x) @(pure) { return x != x; }
+//fn bool f64.isnan(f64 x) @(pure) { return x != x; }
+//fn bool f32.signbit(f32 f) { FP32 u; u.f = f; return (u.u >> 31) & 1; }
+//fn bool f64.signbit(f64 d) { FP64 u; u.d = d; return (u.u >> 63) & 1; }
+int float.fpclassify(float) @(pure, cname="__fpclassifyf");
+int double.fpclassify(double) @(pure, cname="__fpclassifyd");
+int float.isnormal(float) @(pure, cname="__isnormalf");
+int double.isnormal(double) @(pure, cname="__isnormald");
+int float.isfinite(float) @(pure, cname="__isfinitef");
+int double.isfinite(double) @(pure, cname="__isfinited");
+int float.isinf(float) @(pure, cname="__isinff");
+int double.isinf(double) @(pure, cname="__isinfd");
+#endif
+
+float acosf(float) @(pure);
+double acos(double) @(pure);
+//long double acosl(long double) @(pure);
+
+float asinf(float) @(pure);
+double asin(double) @(pure);
+//long double asinl(long double) @(pure);
+
+float atanf(float) @(pure);
+double atan(double) @(pure);
+//long double atanl(long double) @(pure);
+
+float atan2f(float, float) @(pure);
+double atan2(double, double) @(pure);
+//long double atan2l(long double, long double) @(pure);
+
+float cosf(float) @(pure);
+double cos(double) @(pure);
+//long double cosl(long double) @(pure);
+
+float sinf(float) @(pure);
+double sin(double) @(pure);
+//long double sinl(long double) @(pure);
+
+float tanf(float) @(pure);
+double tan(double) @(pure);
+//long double tanl(long double) @(pure);
+
+float acoshf(float) @(pure);
+double acosh(double) @(pure);
+//long double acoshl(long double) @(pure);
+
+float asinhf(float) @(pure);
+double asinh(double) @(pure);
+//long double asinhl(long double) @(pure);
+
+float atanhf(float) @(pure);
+double atanh(double) @(pure);
+//long double atanhl(long double) @(pure);
+
+float coshf(float) @(pure);
+double cosh(double) @(pure);
+//long double coshl(long double) @(pure);
+
+float sinhf(float) @(pure);
+double sinh(double) @(pure);
+//long double sinhl(long double) @(pure);
+
+float tanhf(float) @(pure);
+double tanh(double) @(pure);
+//long double tanhl(long double) @(pure);
+
+float expf(float) @(pure);
+double exp(double) @(pure);
+//long double expl(long double) @(pure);
+
+float exp2f(float) @(pure);
+double exp2(double) @(pure);
+//long double exp2l(long double) @(pure);
+
+float expm1f(float) @(pure);
+double expm1(double) @(pure);
+//long double expm1l(long double) @(pure);
+
+float logf(float) @(pure);
+double log(double) @(pure);
+//long double logl(long double) @(pure);
+
+float log10f(float) @(pure);
+double log10(double) @(pure);
+//long double log10l(long double) @(pure);
+
+float log2f(float) @(pure);
+double log2(double) @(pure);
+//long double log2l(long double) @(pure);
+
+float log1pf(float) @(pure);
+double log1p(double) @(pure);
+//long double log1pl(long double) @(pure);
+
+float logbf(float) @(pure);
+double logb(double) @(pure);
+//long double logbl(long double) @(pure);
+
+float modff(float, float*) @(pure);
+double modf(double, double*) @(pure);
+//long double modfl(long double, long double*) @(pure);
+
+float ldexpf(float, int) @(pure);
+double ldexp(double, int) @(pure);
+//long double ldexpl(long double, int) @(pure);
+
+float frexpf(float, int*) @(pure);
+double frexp(double, int*) @(pure);
+//long double frexpl(long double, int*) @(pure);
+
+int ilogbf(float) @(pure);
+int ilogb(double) @(pure);
+//int ilogbl(long double) @(pure);
+
+float scalbnf(float, int) @(pure);
+double scalbn(double, int) @(pure);
+//long double scalbnl(long double, int) @(pure);
+
+float scalblnf(float, long int) @(pure);
+double scalbln(double, long int) @(pure);
+//long double scalblnl(long double, long int) @(pure);
+
+float fabsf(float) @(pure);
+double fabs(double) @(pure);
+//long double fabsl(long double) @(pure);
+
+float cbrtf(float) @(pure);
+double cbrt(double) @(pure);
+//long double cbrtl(long double) @(pure);
+
+float hypotf(float, float) @(pure);
+double hypot(double, double) @(pure);
+//long double hypotl(long double, long double) @(pure);
+
+float powf(float, float) @(pure);
+double pow(double, double) @(pure);
+//long double powl(long double, long double) @(pure);
+
+float sqrtf(float) @(pure);
+double sqrt(double) @(pure);
+//long double sqrtl(long double) @(pure);
+
+float erff(float) @(pure);
+double erf(double) @(pure);
+//long double erfl(long double) @(pure);
+
+float erfcf(float) @(pure);
+double erfc(double) @(pure);
+//long double erfcl(long double) @(pure);
+
+float lgammaf(float) @(pure);
+double lgamma(double) @(pure);
+//long double lgammal(long double) @(pure);
+
+float tgammaf(float) @(pure);
+double tgamma(double) @(pure);
+//long double tgammal(long double) @(pure);
+
+float ceilf(float) @(pure);
+double ceil(double) @(pure);
+//long double ceill(long double) @(pure);
+
+float floorf(float) @(pure);
+double floor(double) @(pure);
+//long double floorl(long double) @(pure);
+
+float nearbyintf(float) @(pure);
+double nearbyint(double) @(pure);
+//long double nearbyintl(long double) @(pure);
+
+float rintf(float) @(pure);
+double rint(double) @(pure);
+//long double rintl(long double) @(pure);
+
+long int lrintf(float) @(pure);
+long int lrint(double) @(pure);
+//long int lrintl(long double) @(pure);
+
+float roundf(float) @(pure);
+double round(double) @(pure);
+//long double roundl(long double) @(pure);
+
+long int lroundf(float) @(pure);
+long int lround(double) @(pure);
+//long int lroundl(long double) @(pure);
+
+long long int llrintf(float) @(pure);
+long long int llrint(double) @(pure);
+//long long int llrintl(long double) @(pure);
+
+long long int llroundf(float) @(pure);
+long long int llround(double) @(pure);
+//long long int llroundl(long double) @(pure);
+
+float truncf(float) @(pure);
+double trunc(double) @(pure);
+//long double truncl(long double) @(pure);
+
+float fmodf(float, float) @(pure);
+double fmod(double, double) @(pure);
+//long double fmodl(long double, long double) @(pure);
+
+float remainderf(float, float) @(pure);
+double remainder(double, double) @(pure);
+//long double remainderl(long double, long double) @(pure);
+
+float remquof(float, float, int*) @(pure);
+double remquo(double, double, int*) @(pure);
+//long double remquol(long double, long double, int*) @(pure);
+
+float copysignf(float, float) @(pure);
+double copysign(double, double) @(pure);
+//long double copysignl(long double, long double) @(pure);
+
+float nanf(const char*);
+double nan(const char*);
+//long double nanl(const char*);
+
+float nextafterf(float, float) @(pure);
+double nextafter(double, double) @(pure);
+//long double nextafterl(long double, long double) @(pure);
+
+//double nexttoward(double, long double) @(pure);
+//float nexttowardf(float, long double) @(pure);
+//long double nexttowardl(long double, long double) @(pure);
+
+float fdimf(float, float) @(pure);
+double fdim(double, double) @(pure);
+//long double fdiml(long double, long double);
+
+float fmaxf(float, float) @(pure);
+double fmax(double, double) @(pure);
+//long double fmaxl(long double, long double) @(pure);
+
+float fminf(float, float) @(pure);
+double fmin(double, double) @(pure);
+//long double fminl(long double, long double) @(pure);
+
+float fmaf(float, float, float) @(pure);
+double fma(double, double, double) @(pure);
+//long double fmal(long double, long double, long double) @(pure);
+
+const double M_E         = 2.71828182845904523536028747135266250;   /* e */
+const double M_LOG2E     = 1.44269504088896340735992468100189214;   /* log2(e) */
+const double M_LOG10E    = 0.434294481903251827651128918916605082;  /* log10(e) */
+const double M_LN2       = 0.693147180559945309417232121458176568;  /* loge(2) */
+const double M_LN10      = 2.30258509299404568401799145468436421;   /* loge(10) */
+const double M_PI        = 3.14159265358979323846264338327950288;   /* pi */
+const double M_PI_2      = 1.57079632679489661923132169163975144;   /* pi/2 */
+const double M_PI_4      = 0.785398163397448309615660845819875721;  /* pi/4 */
+const double M_1_PI      = 0.318309886183790671537767526745028724;  /* 1/pi */
+const double M_2_PI      = 0.636619772367581343075535053490057448;  /* 2/pi */
+const double M_2_SQRTPI  = 1.12837916709551257389615890312154517;   /* 2/sqrt(pi) */
+const double M_SQRT2     = 1.41421356237309504880168872420969808;   /* sqrt(2) */
+const double M_SQRT1_2   = 0.707106781186547524400844362104849039;  /* 1/sqrt(2) */
+
+//const float MAXFLOAT    = 0x1.fffffep+127F   // use FLT_MAX instead?

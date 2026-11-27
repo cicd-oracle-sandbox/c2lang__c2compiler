@@ -1,0 +1,3 @@
+module test;
+
+fn void test2(i8[3] arg1) {}   // @error{array types are not allowed here}
