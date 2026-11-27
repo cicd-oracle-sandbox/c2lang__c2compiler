@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [ header ]
+  pull_request:
+    branches: [ header ]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+        llvm_version: [16]
+
+    steps:
+      - name: clone repo
+        uses: actions/checkout@v6
+
+      - name: header dump
+        run: make globals
+
+  #  linux-32bits:
+  #    name: Linux 32-bits
+  #    runs-on: ubuntu-latest
+  #    defaults:
+  #      run:
+  #        shell: alpine.sh {0}
+  #    steps:
+  #      - uses: actions/checkout@v6
+  #      - uses: jirutka/setup-alpine@v1
+  #        with:
+  #          arch: x86
+  #          packages: "build-base make"
+  #      - name: header dump
+  #        run: make globals CONFIG_32BIT=y
+
+  macos:
+    name: macOS
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    steps:
+      - uses: actions/checkout@v6
+      - name: header dump
+        run: make globals
+
+  openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: header dump
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg_add gmake
+          run: |
+            gmake globals MAKE=gmake
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: header dump
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y gmake
+          run: |
+            . env.sh
+            gmake globals MAKE=gmake
