@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ header ]
+  pull_request:
+    branches: [ header ]
+
+jobs:
+  linux:
+    name: Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+        llvm_version: [16]
+
+    steps:
+      - name: clone repo
+        uses: actions/checkout@v6
+
+      - name: header dump
+        run: make globals
+
+  macos:
+    name: macOS
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
+    steps:
+      - name: clone repo
+        uses: actions/checkout@v6
+      - name: header dump
+        run: make globals
+
+  openbsd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: clone repo
+        uses: actions/checkout@v6
+      - name: header dump
+        run: make globals
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: clone repo
+        uses: actions/checkout@v6
+      - name: header dump
+        run: make globals
